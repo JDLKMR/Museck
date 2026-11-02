@@ -12,9 +12,6 @@ import time
 import base64
 import hashlib
 import ssl
-import threading
-import stat
-import sys
 import decky
 import urllib.request
 import urllib.error
@@ -26,14 +23,14 @@ import urllib.parse
 # which no amount of patience will transfer, let alone queue.
 MAX_QUEUE_TRACKS = 2000
 
+# Cover art is fetched small for list rows (they draw it at ~40px) but the
+# now-playing art is drawn at up to ~170px, often on a scaled display, so it
+# needs a much larger source or it is visibly upscaled and blurry.
+THUMB_SIZE = 100
+HERO_ART_SIZE = 400
+
 # Reported to the media server when Museck identifies itself as a player.
 MUSECK_VERSION = "1.0"
-
-# Sent on every urllib request Museck makes. Without it urllib identifies
-# as "Python-urllib/<version>", which Cloudflare's WAF blocks by default —
-# a server behind a Cloudflare tunnel then 403s every API call (issue #11).
-# (The audio stream itself is fetched by ffplay, which sends its own UA.)
-USER_AGENT = f"Museck/{MUSECK_VERSION}"
 
 # How often to re-report progress while a track plays.
 PLAYBACK_REPORT_INTERVAL = 10
@@ -48,25 +45,6 @@ async def _to_thread(func, *args, **kwargs):
     """
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, functools.partial(func, *args, **kwargs))
-
-
-def _is_counted_play(position_ms: int, duration_ms: int) -> bool:
-    """Whether a play has been heard long enough to count as a play.
-
-    The usual scrobble rule, shared by every backend that has a separate
-    "count this play" call: half the track or four minutes, whichever comes
-    first, and never for tracks of 30 seconds or less. Position is
-    pause-adjusted listened time, so this measures hearing, not wall clock
-    since the track started. When the server gave no duration at all, fall
-    back to four minutes of actual listening.
-    """
-    if position_ms <= 0:
-        return False
-    if duration_ms <= 0:
-        return position_ms >= 240_000
-    if duration_ms <= 30_000:
-        return False
-    return position_ms >= min(duration_ms / 2, 240_000)
 
 
 # =============================================================================
@@ -85,10 +63,7 @@ class MusicService:
 
     def _http_get(self, url: str, headers: dict = None, timeout: int = 10) -> bytes:
         """HTTP GET returning raw bytes."""
-        merged = {"User-Agent": USER_AGENT}
-        if headers:
-            merged.update(headers)
-        req = urllib.request.Request(url, headers=merged)
+        req = urllib.request.Request(url, headers=headers or {})
         with urllib.request.urlopen(req, timeout=timeout, context=self._ssl_ctx) as resp:
             return resp.read()
 
@@ -96,15 +71,6 @@ class MusicService:
         """HTTP GET returning parsed JSON."""
         data = self._http_get(url, headers, timeout)
         return json.loads(data.decode("utf-8"))
-
-    def _http_post(self, url: str, headers: dict, body: bytes, timeout: int = 10) -> bytes:
-        """HTTP POST returning raw bytes (many reporting endpoints answer 204)."""
-        merged = {"User-Agent": USER_AGENT}
-        if headers:
-            merged.update(headers)
-        req = urllib.request.Request(url, data=body, headers=merged, method="POST")
-        with urllib.request.urlopen(req, timeout=timeout, context=self._ssl_ctx) as resp:
-            return resp.read()
 
     # --- Interface methods (must be overridden) ---
 
@@ -138,7 +104,7 @@ class MusicService:
     def get_stream_url(self, track_key: str) -> str:
         raise NotImplementedError
 
-    def get_image_url(self, thumb_id: str, width: int = 100, height: int = 100) -> str:
+    def get_image_url(self, thumb_id: str, width: int = THUMB_SIZE, height: int = THUMB_SIZE) -> str:
         raise NotImplementedError
 
     def get_libraries(self) -> list:
@@ -160,37 +126,6 @@ class MusicService:
         """
         return
 
-    def get_server_status(self) -> dict:
-        """Live status for the status card: is the server answering, how
-        fast, and what is it called.
-
-        Backends with richer status surfaces override this and add their
-        sections (library counts, uptime, live sessions) on top of the
-        same base shape, so the frontend renders one normalized dict.
-        """
-        started = time.monotonic()
-        try:
-            result = self.test_connection()
-        except Exception as e:
-            result = {"success": False, "message": str(e)}
-        status = {
-            "success": True,
-            "connected": bool(result.get("success")),
-            "server_type": self.config.get("type", ""),
-            "server_name": result.get("server_name", ""),
-            "message": result.get("message", ""),
-            "response_time_ms": int((time.monotonic() - started) * 1000),
-            "checked_at": int(time.time()),
-        }
-        # Jellyfin/Emby test_connection returns the credentials its auth
-        # exchange produced; pass them through so the Plugin layer can
-        # persist them (the status callable pops them back out before
-        # anything reaches the frontend).
-        for field in ("api_key", "user_id"):
-            if result.get(field):
-                status[field] = result[field]
-        return status
-
 
 # =============================================================================
 # Plex Service
@@ -210,15 +145,6 @@ class PlexService(MusicService):
         # Stable per-installation id so Plex treats this as one returning
         # device rather than a new phantom player on every launch.
         self.client_id = config.get("client_id", "")
-        # Scrobble bookkeeping (see report_playback): a Plex scrobble is a
-        # counter, so it is latched once per play instance and only ever
-        # touched under this lock, exactly as in SubsonicService.
-        self._scrobble_track_id = ""
-        self._scrobble_last_position = 0
-        self._scrobble_sent = False
-        self._scrobble_lock = threading.Lock()
-        self._closed_track_id = ""
-        self._closed_position = 0
 
     def _client_headers(self) -> dict:
         """Identify Museck as a player, which is what makes Plex open a session."""
@@ -236,80 +162,25 @@ class PlexService(MusicService):
         }
 
     def report_playback(self, rating_key: str, state: str, position_ms: int, duration_ms: int):
-        """Report progress to /:/timeline, and scrobble a counted play.
+        """Report progress to /:/timeline.
 
-        The timeline alone makes Plex open a session (Now Playing, resume
-        offset, Tautulli and anything else watching sessions) — but it does
-        not move the play count. Verified on a live PMS 1.43.4 (Oct 2026)
-        with this exact call shape: a timeline-only full play (stopped at
-        100%) left viewCount untouched, a scrobble alone set it to 1, and
-        timeline + scrobble + timeline-stop set it to exactly 1, no double
-        count. So a play that has been heard long enough to count (the
-        shared _is_counted_play rule) is also scrobbled, exactly once per
-        play instance. Note the scrobble `key` is the bare rating key —
-        the /library/metadata/… path form used for the timeline key is
-        answered 404 there.
+        Without this Plex only sees an anonymous file download, so nothing is
+        recorded: no active session, no play count, and nothing for Tautulli
+        or anything else watching sessions to pick up.
         """
         if not rating_key:
             return
-        position_ms = max(0, int(position_ms))
-        duration_ms = max(0, int(duration_ms))
         params = {
             "ratingKey": str(rating_key),
             "key": f"/library/metadata/{rating_key}",
             "identifier": "com.plexapp.plugins.library",
             "state": state,
-            "time": str(position_ms),
-            "duration": str(duration_ms),
-            "playbackTime": str(position_ms),
+            "time": str(max(0, int(position_ms))),
+            "duration": str(max(0, int(duration_ms))),
+            "playbackTime": str(max(0, int(position_ms))),
         }
         url = f"{self.server_url}/:/timeline?{urllib.parse.urlencode(params)}"
         self._http_get(url, self._client_headers(), timeout=5)
-
-        if state not in ("playing", "stopped"):
-            return
-        with self._scrobble_lock:
-            track_id = str(rating_key)
-            # A track change, or the position jumping backwards (replay,
-            # loop, re-queuing the same track), is a new play instance.
-            new_instance = (track_id != self._scrobble_track_id
-                            or position_ms + 2_000 < self._scrobble_last_position)
-            if new_instance:
-                self._scrobble_track_id = track_id
-                self._scrobble_sent = False
-                self._closed_track_id = ""
-                self._closed_position = 0
-            elif state == "playing" and position_ms <= 2_000:
-                # A (re)start at the beginning, too small for the reset
-                # heuristic to have caught: it still ends the closed era.
-                self._closed_track_id = ""
-                self._closed_position = 0
-            elif (state == "playing" and track_id == self._closed_track_id
-                    and position_ms > 2_000 and position_ms + 2_000 >= self._closed_position):
-                # A report dispatched before this play was stopped, landing
-                # after it — its backjump would otherwise read as a fresh
-                # instance and scrobble a second time. (The timeline above
-                # has already been sent; this guards only the counter.)
-                return
-            self._scrobble_last_position = position_ms
-            if state == "stopped":
-                self._closed_track_id = track_id
-                self._closed_position = position_ms
-            if self._scrobble_sent or not _is_counted_play(position_ms, duration_ms):
-                return
-            # Latch before the send, restore on failure (the next scheduled
-            # report retries), as in SubsonicService.report_playback.
-            self._scrobble_sent = True
-            try:
-                scrobble_params = {
-                    "key": track_id,
-                    "identifier": "com.plexapp.plugins.library",
-                }
-                scrobble_url = f"{self.server_url}/:/scrobble?{urllib.parse.urlencode(scrobble_params)}"
-                self._http_get(scrobble_url, self._client_headers(), timeout=5)
-            except Exception:
-                self._scrobble_sent = False
-                raise
 
     def get_libraries(self) -> list:
         data = self._api_get("/library/sections")
@@ -543,7 +414,7 @@ class PlexService(MusicService):
     def get_stream_url(self, track_key: str) -> str:
         return f"{self.server_url}{track_key}?X-Plex-Token={self.token}"
 
-    def get_image_url(self, thumb_path: str, width: int = 100, height: int = 100) -> str:
+    def get_image_url(self, thumb_path: str, width: int = THUMB_SIZE, height: int = THUMB_SIZE) -> str:
         if not thumb_path:
             return ""
         encoded_thumb = urllib.parse.quote(thumb_path, safe='')
@@ -668,18 +539,6 @@ class JellyfinService(MusicService):
         self.username = config.get("username", "")
         self.password = config.get("password", "")
         self._authenticated = bool(self.api_key and self.user_id)
-        # Playback-session bookkeeping for report_playback: the server keys
-        # a session on the auth identity, and a play instance gets one
-        # PlaySessionId, opened by /Sessions/Playing and closed by
-        # /Sessions/Playing/Stopped. Reports run on executor threads and
-        # start/stop ordering matters, so they are serialised by this lock.
-        self._report_lock = threading.Lock()
-        self._report_track_id = ""
-        self._report_last_position = 0
-        self._session_started = False
-        self._play_session_id = ""
-        self._closed_track_id = ""
-        self._closed_position = 0
 
     def _authenticate(self) -> dict:
         """Authenticate with username/password to get access token and user ID."""
@@ -689,7 +548,6 @@ class JellyfinService(MusicService):
         headers = {
             "Authorization": 'MediaBrowser Client="Museck", Device="SteamDeck", DeviceId="museck-steamdeck", Version="1.0"',
             "Content-Type": "application/json",
-            "User-Agent": USER_AGENT,
         }
         body = json.dumps({"Username": self.username, "Pw": self.password}).encode("utf-8")
         req = urllib.request.Request(url, data=body, headers=headers, method="POST")
@@ -735,116 +593,6 @@ class JellyfinService(MusicService):
             self._authenticate()
             return self._http_json(self._api_url(endpoint, extra_params), self._auth_headers())
 
-    def _api_post(self, endpoint: str, payload: dict) -> bytes:
-        """POST a JSON body, with the same token-expiry retry as _api_get."""
-        self._ensure_auth()
-        body = json.dumps(payload).encode("utf-8")
-
-        def post_once():
-            headers = dict(self._auth_headers())
-            headers["Content-Type"] = "application/json"
-            return self._http_post(self._api_url(endpoint), headers, body, timeout=5)
-
-        try:
-            return post_once()
-        except urllib.error.HTTPError as e:
-            if e.code not in (401, 403) or not self.username:
-                raise
-            decky.logger.info("Access token rejected, re-authenticating")
-            self._authenticated = False
-            self._authenticate()
-            return post_once()
-
-    def report_playback(self, rating_key: str, state: str, position_ms: int, duration_ms: int):
-        """Report playback to the /Sessions/Playing endpoints.
-
-        Without this the server only sees an anonymous stream download, so
-        nothing is recorded: no active session on the dashboard, no play
-        history, no play count. This is the standard session protocol the
-        official clients use — start announces the item, progress carries
-        the (pause-aware) position, stopped closes the session — and the
-        server itself decides what counts as a play from the positions it
-        receives. Every report carries PositionTicks: a stopped report
-        without one is read by the server as "played to completion".
-
-        Emby inherits this unchanged: same endpoints, with auth supplied by
-        its own _auth_headers/_authenticate overrides.
-        """
-        if not rating_key:
-            return
-        with self._report_lock:
-            self._report_playback_locked(str(rating_key), state, position_ms)
-
-    def _report_playback_locked(self, track_id: str, state: str, position_ms):
-        position_ms = max(0, int(position_ms))
-        ticks = position_ms * 10_000  # 100ns ticks, the MediaBrowser unit
-
-        # A track change, or the position jumping backwards (replay, loop,
-        # re-queuing the same track), is a new play instance and session.
-        new_instance = (track_id != self._report_track_id
-                        or position_ms + 2_000 < self._report_last_position)
-        if new_instance:
-            self._report_track_id = track_id
-            self._session_started = False
-            self._play_session_id = os.urandom(16).hex()
-            self._closed_track_id = ""
-            self._closed_position = 0
-        elif state == "playing" and position_ms <= 2_000:
-            # A (re)start at the beginning ends the closed era, even when
-            # the reset heuristic could not see it (previous position low).
-            self._closed_track_id = ""
-            self._closed_position = 0
-        elif (state == "playing" and track_id == self._closed_track_id
-                and position_ms > 2_000 and position_ms + 2_000 >= self._closed_position):
-            # A report dispatched before this play was stopped, landing
-            # after it: reopening would leave a zombie session on the
-            # server that nothing ever closes. A genuine replay restarts
-            # at position ~0, which is the reset case above.
-            return
-        self._report_last_position = position_ms
-
-        if state == "playing":
-            if not self._session_started:
-                if not self._play_session_id:
-                    # First ever play, or a fresh start after a stop closed
-                    # the previous session at a position too low for the
-                    # reset heuristic above to have caught.
-                    self._play_session_id = os.urandom(16).hex()
-                self._api_post("/Sessions/Playing", {
-                    "ItemId": track_id,
-                    "PlaySessionId": self._play_session_id,
-                    "CanSeek": False,
-                    "PlayMethod": "DirectPlay",
-                })
-                self._session_started = True
-            else:
-                self._api_post("/Sessions/Playing/Progress", {
-                    "ItemId": track_id,
-                    "PlaySessionId": self._play_session_id,
-                    "PositionTicks": ticks,
-                    "IsPaused": False,
-                    "CanSeek": False,
-                })
-        elif state == "paused":
-            if self._session_started:
-                self._api_post("/Sessions/Playing/Progress", {
-                    "ItemId": track_id,
-                    "PlaySessionId": self._play_session_id,
-                    "PositionTicks": ticks,
-                    "IsPaused": True,
-                    "CanSeek": False,
-                })
-        elif state == "stopped" and self._session_started:
-            self._api_post("/Sessions/Playing/Stopped", {
-                "ItemId": track_id,
-                "PlaySessionId": self._play_session_id,
-                "PositionTicks": ticks,
-            })
-            self._session_started = False
-            self._play_session_id = ""
-            self._closed_track_id = track_id
-            self._closed_position = position_ms
-
     def test_connection(self) -> dict:
         try:
             # Authenticate with username/password if needed
@@ -868,22 +616,6 @@ class JellyfinService(MusicService):
             return {"success": False, "message": f"Cannot reach server: {e.reason}"}
         except Exception as e:
             return {"success": False, "message": f"Connection error: {str(e)}"}
-
-    def get_server_status(self) -> dict:
-        status = super().get_server_status()
-        if status.get("connected"):
-            # /System/Info/Public is unauthenticated and carries the
-            # version; the base status only surfaces the server name.
-            try:
-                info = self._http_json(f"{self.server_url}/System/Info/Public", timeout=5)
-                if isinstance(info, dict):
-                    if info.get("Version"):
-                        status["version"] = info["Version"]
-                    if info.get("ProductName"):
-                        status["server_product"] = info["ProductName"]
-            except Exception:
-                pass
-        return status
 
     def discover_servers(self) -> list:
         """Discover Jellyfin servers via UDP broadcast on port 7359."""
@@ -1033,7 +765,7 @@ class JellyfinService(MusicService):
     def get_stream_url(self, track_key: str) -> str:
         return f"{self.server_url}/Audio/{track_key}/stream?static=true&api_key={self.api_key}"
 
-    def get_image_url(self, thumb_id: str, width: int = 100, height: int = 100) -> str:
+    def get_image_url(self, thumb_id: str, width: int = THUMB_SIZE, height: int = THUMB_SIZE) -> str:
         if not thumb_id:
             return ""
         return (
@@ -1077,7 +809,6 @@ class EmbyService(JellyfinService):
         headers = {
             "X-Emby-Authorization": 'MediaBrowser Client="Museck", Device="SteamDeck", DeviceId="museck-steamdeck", Version="1.0"',
             "Content-Type": "application/json",
-            "User-Agent": USER_AGENT,
         }
         body = json.dumps({"Username": self.username, "Pw": self.password}).encode("utf-8")
         req = urllib.request.Request(url, data=body, headers=headers, method="POST")
@@ -1160,23 +891,6 @@ class SubsonicService(MusicService):
         super().__init__(config)
         self.username = config.get("username", "")
         self.password = config.get("password", "")
-        # Scrobble bookkeeping for report_playback: the plugin reports every
-        # 10 seconds, but a play may only be submitted once, so remember what
-        # the current play instance has already sent. A play instance is
-        # identified by its track plus a position that never jumps backwards;
-        # a track change or a position reset (replay, loop) starts a new one.
-        self._report_track_id = ""
-        self._report_last_position = 0
-        self._now_playing_sent = False
-        self._scrobble_sent = False
-        self._closed_track_id = ""
-        self._closed_position = 0
-        # report_playback runs on executor threads and its callers are not
-        # mutually exclusive (the 1s status poll, play/pause/stop actions),
-        # so the latches above are only ever touched under this lock —
-        # a scrobble is a counter, not idempotent state like Plex's
-        # timeline, and two overlapping reports must not both submit.
-        self._report_lock = threading.Lock()
 
     def _auth_params(self) -> dict:
         salt = os.urandom(8).hex()
@@ -1197,116 +911,10 @@ class SubsonicService(MusicService):
         qs = urllib.parse.urlencode(params)
         return f"{self.server_url}/rest/{endpoint}?{qs}"
 
-    def _api_get(self, endpoint: str, extra_params: dict = None, timeout: int = 10) -> dict:
+    def _api_get(self, endpoint: str, extra_params: dict = None) -> dict:
         url = self._api_url(endpoint, extra_params)
-        data = self._http_json(url, timeout=timeout)
+        data = self._http_json(url)
         return data.get("subsonic-response", {})
-
-    @staticmethod
-    def _scrobble_due(position_ms: int, duration_ms: int) -> bool:
-        """Whether a play has been heard long enough to count (shared rule)."""
-        return _is_counted_play(position_ms, duration_ms)
-
-    def _send_scrobble(self, track_id: str, submission: str):
-        """Call /rest/scrobble, treating a server-side rejection as a failure.
-
-        Subsonic-style APIs often answer HTTP 200 with
-        subsonic-response.status == "failed" — the latch logic below must
-        see that as a failure, or the play is latched as recorded and never
-        retried.
-        """
-        resp = self._api_get(
-            "scrobble", {"id": track_id, "submission": submission}, timeout=5)
-        if resp.get("status") == "failed":
-            error = resp.get("error", {}) if isinstance(resp.get("error"), dict) else {}
-            raise RuntimeError(
-                f"scrobble rejected by server: {error.get('message', 'unknown error')}")
-
-    def report_playback(self, rating_key: str, state: str, position_ms: int, duration_ms: int):
-        """Report playback via /rest/scrobble.
-
-        Without this the server only sees an anonymous stream download, so
-        nothing is recorded: no play count, no recently-played entry, and
-        nothing for the server's own Last.fm/ListenBrainz forwarding.
-
-        `submission=false` is the "now playing" notice, sent once when a
-        track starts. `submission=true` is the actual scrobble that bumps
-        the play count, sent exactly once per play, when the play has been
-        heard long enough to count (see _scrobble_due). The plugin reports
-        every 10 seconds, so both sends are latched per play instance.
-        """
-        if not rating_key:
-            return
-        with self._report_lock:
-            self._report_playback_locked(str(rating_key), state, position_ms, duration_ms)
-
-    def _report_playback_locked(self, track_id: str, state: str, position_ms, duration_ms):
-        position_ms = max(0, int(position_ms))
-        duration_ms = max(0, int(duration_ms))
-
-        # A track change, or the position jumping backwards (replay, loop,
-        # re-queuing the same track), is a new play instance.
-        new_instance = (track_id != self._report_track_id
-                        or position_ms + 2_000 < self._report_last_position)
-        if new_instance:
-            self._report_track_id = track_id
-            self._now_playing_sent = False
-            self._scrobble_sent = False
-            self._closed_track_id = ""
-            self._closed_position = 0
-        elif state == "playing" and position_ms <= 2_000:
-            # A (re)start at the beginning ends the closed era, even when
-            # the reset heuristic could not see it (previous position low).
-            self._closed_track_id = ""
-            self._closed_position = 0
-        elif (state == "playing" and track_id == self._closed_track_id
-                and position_ms > 2_000 and position_ms + 2_000 >= self._closed_position):
-            # A report dispatched before this play was stopped, landing
-            # after it: reopening the instance would announce (and could
-            # re-submit) a play that already ended. A genuine replay is
-            # never caught by this — it restarts at position ~0, which
-            # clears the closed markers above, not this branch.
-            return
-        self._report_last_position = position_ms
-
-        # Latches are set before the send and restored on failure: the
-        # caller (Plugin._report_playback) never retries a report, so a
-        # failure must leave the latch unset, while concurrent reports
-        # serialised by the lock must never both submit. A failure is
-        # retried by the next scheduled report, not by this call.
-        if state == "playing":
-            if not self._now_playing_sent:
-                self._now_playing_sent = True
-                try:
-                    self._send_scrobble(track_id, "false")
-                except Exception:
-                    self._now_playing_sent = False
-                    raise
-            if not self._scrobble_sent and self._scrobble_due(position_ms, duration_ms):
-                self._scrobble_sent = True
-                try:
-                    self._send_scrobble(track_id, "true")
-                except Exception:
-                    self._scrobble_sent = False
-                    raise
-        elif state == "stopped":
-            # Backstop: a play that reached the threshold without a playing
-            # report landing on it (e.g. the final poll raced the track end)
-            # still counts. A play stopped early does not.
-            if not self._scrobble_sent and self._scrobble_due(position_ms, duration_ms):
-                self._scrobble_sent = True
-                try:
-                    self._send_scrobble(track_id, "true")
-                except Exception:
-                    self._scrobble_sent = False
-                    raise
-            # The next play must announce itself again. The scrobble latch
-            # clears via the new play's position reset (or track change);
-            # that always fires when a scrobble was possible, since being
-            # due requires position well past the 2s reset tolerance.
-            self._now_playing_sent = False
-            self._closed_track_id = track_id
-            self._closed_position = position_ms
 
     def test_connection(self) -> dict:
         try:
@@ -1326,23 +934,6 @@ class SubsonicService(MusicService):
             return {"success": False, "message": f"Cannot reach server: {e.reason}"}
         except Exception as e:
             return {"success": False, "message": f"Connection error: {str(e)}"}
-
-    def get_server_status(self) -> dict:
-        status = super().get_server_status()
-        if status.get("connected"):
-            # The ping payload names the server software and its version;
-            # test_connection folds them into the display name, the status
-            # card wants them as separate fields.
-            try:
-                resp = self._api_get("ping", timeout=5)
-                version = resp.get("serverVersion") or resp.get("version")
-                if version:
-                    status["version"] = version
-                if resp.get("type"):
-                    status["server_product"] = resp["type"]
-            except Exception:
-                pass
-        return status
 
     def get_playlists(self) -> list:
         resp = self._api_get("getPlaylists")
@@ -1473,7 +1064,7 @@ class SubsonicService(MusicService):
         qs = urllib.parse.urlencode(params)
         return f"{self.server_url}/rest/stream?{qs}"
 
-    def get_image_url(self, thumb_id: str, width: int = 100, height: int = 100) -> str:
+    def get_image_url(self, thumb_id: str, width: int = THUMB_SIZE, height: int = THUMB_SIZE) -> str:
         if not thumb_id:
             return ""
         params = self._auth_params()
@@ -1500,752 +1091,6 @@ class SubsonicService(MusicService):
         }
 
 
-class SoulSyncService(MusicService):
-    """SoulSync backend.
-
-    SoulSync is itself the server here: Museck talks to its public API v1
-    (API-key auth; keys are created in SoulSync's Settings) for the
-    library, and to its long-standing web routes for streaming
-    (/stream/library-audio), play logging (/api/library/log-play) and
-    live status (/status, /api/server-activity) — the same surfaces
-    SoulSync's own UI and the Companion extension use.
-    """
-
-    # Genre play has no tracks-by-genre endpoint in the API, so albums
-    # are walked page by page and filtered client-side. Bound the walk so
-    # a huge library cannot turn one tap into minutes of paging.
-    _GENRE_PAGE_SIZE = 200
-    _GENRE_SCAN_MAX_PAGES = 25
-
-    def __init__(self, config: dict):
-        super().__init__(config)
-        self.api_key = config.get("api_key", "")
-        # Metadata for tracks this instance has parsed, keyed by track
-        # id. report_playback only receives a rating key, but SoulSync's
-        # log-play needs title/artist/album, so they are remembered at
-        # parse time.
-        self._track_meta = {}
-        # Album id -> {title, thumb_url, artist_id}, resolved lazily:
-        # track payloads carry no artwork and (on playlist endpoints) no
-        # album/artist names either; album payloads carry all three.
-        self._album_info_cache = {}
-        # Artist id -> name. Album payloads carry artist_id, not the name.
-        self._artist_names = {}
-        # Play-log bookkeeping, same latch discipline as the Subsonic
-        # scrobble: one log per play instance, set before the send and
-        # restored on failure.
-        self._report_track_id = ""
-        self._report_last_position = 0
-        self._log_sent = False
-        self._closed_track_id = ""
-        self._closed_position = 0
-        self._report_lock = threading.Lock()
-
-    # --- API plumbing ---------------------------------------------------
-
-    def _auth_headers(self) -> dict:
-        if self.api_key:
-            return {"Authorization": f"Bearer {self.api_key}"}
-        return {}
-
-    def _api_get(self, path: str, params: dict = None, timeout: int = 15):
-        """GET an API v1 endpoint and unwrap the {success, data} envelope."""
-        url = f"{self.server_url}/api/v1{path}"
-        if params:
-            url += "?" + urllib.parse.urlencode(params)
-        payload = self._http_json(url, headers=self._auth_headers(), timeout=timeout)
-        if isinstance(payload, dict) and "success" in payload:
-            if not payload.get("success"):
-                error = payload.get("error") or {}
-                message = error.get("message") if isinstance(error, dict) else str(error)
-                raise RuntimeError(message or "SoulSync API error")
-            return payload.get("data") or {}
-        return payload
-
-    def _bare_get(self, path: str, timeout: int = 10) -> dict:
-        """GET a non-v1 SoulSync route (bare JSON) using api_key auth."""
-        sep = "&" if "?" in path else "?"
-        url = f"{self.server_url}{path}{sep}api_key={urllib.parse.quote(self.api_key)}"
-        data = self._http_json(url, timeout=timeout)
-        return data if isinstance(data, dict) else {}
-
-    # --- Connection ------------------------------------------------------
-
-    def test_connection(self) -> dict:
-        try:
-            # The v1 system status is the cheapest authenticated call:
-            # it proves the URL answers and the key is accepted.
-            self._api_get("/system/status", timeout=8)
-            return {"success": True, "message": "Connection successful", "server_name": "SoulSync"}
-        except urllib.error.HTTPError as e:
-            if e.code in (401, 403):
-                return {"success": False, "message": "Invalid SoulSync API key. Create one in SoulSync under Settings, then API keys."}
-            if e.code == 429:
-                return {"success": False, "message": "SoulSync rate limit hit. Wait a moment and try again."}
-            return {"success": False, "message": f"HTTP error: {e.code} - {e.reason}"}
-        except urllib.error.URLError as e:
-            return {"success": False, "message": f"Cannot reach server: {e.reason}"}
-        except RuntimeError as e:
-            return {"success": False, "message": str(e)}
-        except Exception as e:
-            return {"success": False, "message": f"Connection error: {str(e)}"}
-
-    # --- Parsing ----------------------------------------------------------
-
-    def _parse_track(self, track: dict, album_title: str = "", album_thumb: str = ""):
-        """Convert an API v1 track payload to Museck's track shape.
-
-        Returns None for tracks that cannot be streamed: SoulSync streams
-        the file from its own disk (with a media-server fallback keyed by
-        track id), so a track with no file_path has nothing to play.
-        """
-        if not isinstance(track, dict):
-            return None
-        track_id = track.get("id")
-        file_path = str(track.get("file_path") or "").strip()
-        if track_id is None or not file_path:
-            return None
-        track_id = str(track_id)
-        album_id = track.get("album_id")
-        thumb = track.get("album_thumb_url") or track.get("thumb_url") or album_thumb or ""
-        if not thumb and album_id is not None:
-            # Track payloads carry no artwork; the album's does. Defer to
-            # get_image_url, which resolves and caches it per album.
-            thumb = f"ssalbum:{album_id}"
-        title = track.get("title") or "Unknown"
-        # Keep the raw (possibly empty) names in the metadata cache:
-        # playlist payloads do not join them (see _fill_track_names), and
-        # log-play must never record a placeholder as if it were truth.
-        artist = track.get("artist_name") or ""
-        album = track.get("album_title") or album_title or ""
-        if len(self._track_meta) > 5000:
-            self._track_meta.clear()
-        self._track_meta[track_id] = {
-            "title": title, "artist": artist, "album": album,
-            "album_id": album_id, "artist_id": track.get("artist_id"),
-        }
-        try:
-            duration = int(track.get("duration") or 0)
-        except (TypeError, ValueError):
-            duration = 0
-        return {
-            # The stream endpoint needs the file path, and the plugin only
-            # hands this key back to get_stream_url, so both the track id
-            # and the path ride in it.
-            "key": f"{track_id}::{file_path}",
-            "ratingKey": track_id,
-            "title": title,
-            "artist": artist or "Unknown",
-            "album": album or "Unknown",
-            "duration": duration,  # SoulSync stores duration in ms already
-            "index": track.get("track_number") or 0,
-            "thumb": str(thumb),
-            "parentThumb": str(thumb),
-        }
-
-    def _parse_tracks(self, tracks, album_title: str = "", album_thumb: str = "") -> list:
-        parsed = []
-        for track in tracks or []:
-            item = self._parse_track(track, album_title, album_thumb)
-            if item:
-                parsed.append(item)
-        return parsed
-
-    def _artist_name(self, artist_id, budget: list = None) -> str:
-        """Resolve an artist id to its name, cached, softly capped.
-
-        Failures are NOT cached: a transient error (a network blip, a
-        rate-limit 429) must not blank the name for the whole session —
-        the next caller retries, like the plugin's thumb hydration does.
-        `budget`, when given, is a one-element list of lookups the caller
-        still allows; only cache misses spend it.
-        """
-        if artist_id is None:
-            return ""
-        key = str(artist_id)
-        if key in self._artist_names:
-            return self._artist_names[key]
-        if len(self._artist_names) >= 64:
-            return ""
-        if budget is not None:
-            if budget[0] <= 0:
-                return ""
-            budget[0] -= 1
-        try:
-            data = self._api_get(f"/library/artists/{key}")
-        except Exception:
-            return ""
-        name = (data.get("artist") or {}).get("name") or ""
-        self._artist_names[key] = name
-        return name
-
-    def _album_info(self, album_id, budget: list = None) -> dict:
-        """Album {title, thumb_url, artist_id} by id, cached.
-
-        Same failure/budget discipline as _artist_name: only successful
-        lookups are cached.
-        """
-        if album_id is None:
-            return {}
-        key = str(album_id)
-        if key in self._album_info_cache:
-            return self._album_info_cache[key]
-        if budget is not None:
-            if budget[0] <= 0:
-                return {}
-            budget[0] -= 1
-        try:
-            data = self._api_get(f"/library/albums/{key}")
-        except Exception:
-            return {}
-        album = data.get("album") or {}
-        info = {
-            "title": album.get("title") or "",
-            "thumb_url": album.get("thumb_url") or "",
-            "artist_id": album.get("artist_id"),
-        }
-        self._album_info_cache[key] = info
-        return info
-
-    def _fill_track_names(self, track: dict, budget: list):
-        """Fill a parsed track's Unknown artist/album from its ids.
-
-        Playlist payloads are the gap: curated rows join neither name,
-        mirrored rows only the artist. Every row carries album_id and
-        artist_id, so resolve through the cached lookups. Tracks the
-        budget runs out on keep their placeholders for display; play
-        reporting still recovers the real names per track (see
-        _send_log_play), so history is never polluted with them.
-        """
-        meta = self._track_meta.get(track["ratingKey"]) or {}
-        album_id = meta.get("album_id")
-        artist_id = meta.get("artist_id")
-        if track["album"] == "Unknown" and album_id is not None:
-            info = self._album_info(album_id, budget)
-            if info.get("title"):
-                track["album"] = info["title"]
-                meta["album"] = info["title"]
-            if artist_id is None:
-                artist_id = info.get("artist_id")
-        if track["artist"] == "Unknown" and artist_id is not None:
-            name = self._artist_name(artist_id, budget)
-            if name:
-                track["artist"] = name
-                meta["artist"] = name
-
-    def _parse_album(self, album: dict, resolve_artist: bool = False) -> dict:
-        artist = album.get("artist_name") or ""
-        if not artist and resolve_artist:
-            artist = self._artist_name(album.get("artist_id"))
-        return {
-            "key": str(album.get("id", "")),
-            "title": album.get("title", "Unknown"),
-            "artist": artist or "Unknown",
-            "year": album.get("year"),
-            "thumb": album.get("thumb_url") or "",
-        }
-
-    # --- Library ----------------------------------------------------------
-
-    def get_playlists(self) -> list:
-        """Curated and mirrored playlists, told apart by key prefix.
-
-        SoulSync keeps the two in separate endpoints with separate id
-        spaces; the prefix routes get_playlist_tracks to the right one.
-        One family failing must not hide the other.
-        """
-        playlists = []
-        errors = []
-        try:
-            data = self._api_get("/library/playlists")
-            for pl in data.get("playlists", []):
-                playlists.append({
-                    "key": f"curated:{pl.get('id')}",
-                    "title": pl.get("name", "Unknown"),
-                    "duration": 0,
-                    "count": pl.get("track_count", 0),
-                    "thumb": "",
-                })
-        except Exception as e:
-            errors.append(e)
-        try:
-            data = self._api_get("/library/mirrored-playlists")
-            for pl in data.get("playlists", []):
-                playlists.append({
-                    "key": f"mirrored:{pl.get('id')}",
-                    "title": pl.get("name", "Unknown"),
-                    "duration": 0,
-                    "count": pl.get("track_count", 0),
-                    "thumb": pl.get("cover_url") or "",
-                })
-        except Exception as e:
-            errors.append(e)
-        if errors and not playlists:
-            raise errors[0]
-        return playlists
-
-    def get_playlist_tracks(self, playlist_key: str) -> list:
-        kind, _, pid = str(playlist_key).partition(":")
-        if kind == "mirrored":
-            data = self._api_get(f"/library/mirrored-playlists/{pid}/tracks")
-        else:
-            data = self._api_get(f"/library/playlists/{pid or playlist_key}/tracks")
-        tracks = self._parse_tracks(data.get("tracks", []))[:MAX_QUEUE_TRACKS]
-        # Playlist rows lack joined names (curated: both, mirrored: the
-        # album), so fill them from the album/artist lookups. The budget
-        # bounds fresh lookups per load — the API allows 60 requests a
-        # minute, and a huge playlist must not spend it all on names;
-        # cached lookups are free and do not count against it.
-        budget = [50]
-        for track in tracks:
-            if track["artist"] == "Unknown" or track["album"] == "Unknown":
-                self._fill_track_names(track, budget)
-        return tracks
-
-    def search_tracks(self, query: str) -> list:
-        """Library track search.
-
-        The API searches one field per call (title or artist) and
-        requires at least one, so a Museck search runs both and merges,
-        title matches first. (The API's /search endpoints search
-        external metadata providers, not the library, so they are not
-        used here: their results have nothing to stream.)
-        """
-        results = []
-        seen = set()
-        errors = []
-        for params in ({"title": query}, {"artist": query}):
-            try:
-                data = self._api_get("/library/tracks", {**params, "limit": 50})
-            except Exception as e:
-                errors.append(e)
-                continue
-            for item in self._parse_tracks(data.get("tracks", [])):
-                if item["ratingKey"] not in seen:
-                    seen.add(item["ratingKey"])
-                    results.append(item)
-        if errors and not results:
-            raise errors[0]
-        return results[:30]
-
-    def search_albums(self, query: str) -> list:
-        data = self._api_get("/library/albums", {"search": query, "limit": 30})
-        return [self._parse_album(a, resolve_artist=True) for a in data.get("albums", [])]
-
-    def search_artists(self, query: str) -> list:
-        data = self._api_get("/library/artists", {"search": query, "limit": 30})
-        artists = []
-        for artist in data.get("artists", []):
-            artists.append({
-                "key": str(artist.get("id", "")),
-                "title": artist.get("name", "Unknown"),
-                "thumb": artist.get("thumb_url") or "",
-            })
-        return artists
-
-    def get_album_tracks(self, album_key: str) -> list:
-        # The album endpoint embeds its tracks plus the album's own
-        # title and artwork, which track rows alone do not carry.
-        data = self._api_get(f"/library/albums/{album_key}")
-        album = data.get("album") or {}
-        return self._parse_tracks(
-            data.get("tracks", []),
-            album_title=album.get("title", ""),
-            album_thumb=album.get("thumb_url") or "",
-        )[:MAX_QUEUE_TRACKS]
-
-    def get_artist_tracks(self, artist_key: str) -> list:
-        # The artist endpoint embeds the album list; each album's tracks
-        # come from the album endpoint, in album order.
-        data = self._api_get(f"/library/artists/{artist_key}")
-        artist_name = (data.get("artist") or {}).get("name") or ""
-        if artist_name:
-            self._artist_names[str(artist_key)] = artist_name
-        all_tracks = []
-        for album in data.get("albums", []):
-            try:
-                album_data = self._api_get(f"/library/albums/{album.get('id')}")
-            except Exception:
-                continue
-            album_obj = album_data.get("album") or album
-            tracks = self._parse_tracks(
-                album_data.get("tracks", []),
-                album_title=album_obj.get("title", ""),
-                album_thumb=album_obj.get("thumb_url") or "",
-            )
-            for track in tracks:
-                if track["artist"] == "Unknown" and artist_name:
-                    track["artist"] = artist_name
-                    self._track_meta[track["ratingKey"]] = {
-                        "title": track["title"], "artist": artist_name,
-                        "album": track["album"],
-                    }
-            all_tracks.extend(tracks)
-            if len(all_tracks) >= MAX_QUEUE_TRACKS:
-                break
-        return all_tracks[:MAX_QUEUE_TRACKS]
-
-    def get_genres(self) -> list:
-        data = self._api_get("/library/genres", {"source": "albums"})
-        genres = []
-        for entry in data.get("genres", []):
-            name = entry.get("name") if isinstance(entry, dict) else entry
-            if name:
-                genres.append({"key": name, "title": name})
-        return sorted(genres, key=lambda g: g["title"].lower())
-
-    def get_genre_tracks(self, genre_key: str) -> list:
-        """Tracks for a genre, assembled client-side.
-
-        The API lists genres and tags albums with them, but has no
-        tracks-by-genre endpoint, so walk the album list, keep albums
-        tagged with the genre, and queue their tracks. The walk is
-        bounded; on a library larger than the bound a genre may come
-        back partial rather than complete.
-        """
-        wanted = str(genre_key).strip().lower()
-        tracks = []
-        for page in range(1, self._GENRE_SCAN_MAX_PAGES + 1):
-            try:
-                data = self._api_get("/library/albums", {
-                    "limit": self._GENRE_PAGE_SIZE, "page": page})
-            except Exception:
-                # A failure mid-walk (the 60/min API budget is the usual
-                # suspect on big libraries) degrades to what was already
-                # gathered instead of discarding it; with nothing
-                # gathered the error is the caller's to see.
-                if tracks:
-                    break
-                raise
-            albums = data.get("albums", [])
-            if not albums:
-                break
-            for album in albums:
-                genres = album.get("genres") or []
-                if not any(str(g).strip().lower() == wanted for g in genres):
-                    continue
-                try:
-                    album_data = self._api_get(f"/library/albums/{album.get('id')}")
-                except Exception:
-                    continue
-                album_obj = album_data.get("album") or album
-                tracks.extend(self._parse_tracks(
-                    album_data.get("tracks", []),
-                    album_title=album_obj.get("title", ""),
-                    album_thumb=album_obj.get("thumb_url") or ""))
-                if len(tracks) >= MAX_QUEUE_TRACKS:
-                    return tracks[:MAX_QUEUE_TRACKS]
-            if len(albums) < self._GENRE_PAGE_SIZE:
-                break
-        return tracks[:MAX_QUEUE_TRACKS]
-
-    # --- Streaming and artwork --------------------------------------------
-
-    def get_stream_url(self, track_key: str) -> str:
-        track_id, _, file_path = str(track_key).partition("::")
-        if not file_path:
-            # A plain key with no embedded path: treat it as the path.
-            track_id, file_path = "", track_id
-        params = {"path": file_path, "api_key": self.api_key}
-        if track_id:
-            # Lets SoulSync fall back to its media-server proxy when the
-            # file is not on its own disk.
-            params["track_id"] = track_id
-        qs = urllib.parse.urlencode(params)
-        return f"{self.server_url}/stream/library-audio?{qs}"
-
-    def _with_api_key(self, url: str) -> str:
-        if "api_key=" in url:
-            return url
-        sep = "&" if "?" in url else "?"
-        return f"{url}{sep}api_key={urllib.parse.quote(self.api_key)}"
-
-    def _proxied_image_url(self, raw_url: str) -> str:
-        """Route a raw stored artwork URL through SoulSync's image proxy,
-        which is what SoulSync's own UI and the extension do: the proxy
-        normalizes media-server art (minting the tokens it needs)
-        server-side instead of the client fetching it directly."""
-        qs = urllib.parse.urlencode({"url": raw_url, "api_key": self.api_key})
-        return f"{self.server_url}/api/image-proxy?{qs}"
-
-    @staticmethod
-    def _is_internal_art_url(url: str) -> bool:
-        """Artwork URLs only the media server (or its LAN) serves sanely."""
-        lowered = url.lower()
-        if any(marker in lowered for marker in (
-                "/library/metadata/", "/items/", "/rest/getcoverart")):
-            return True
-        host = urllib.parse.urlparse(url).hostname or ""
-        if host in ("localhost", "host.docker.internal") or "." not in host:
-            # Loopback aliases, Docker's host gateway, and single-label
-            # LAN hostnames are all names only the server's own network
-            # resolves — the same set SoulSync's own normalizer treats
-            # as internal.
-            return True
-        if host.startswith(("127.", "10.", "192.168.")):
-            return True
-        if host.startswith("172."):
-            try:
-                return 16 <= int(host.split(".")[1]) <= 31
-            except (IndexError, ValueError):
-                return False
-        return False
-
-    def get_image_url(self, thumb_id: str, width: int = 100, height: int = 100) -> str:
-        if not thumb_id:
-            return ""
-        thumb_id = str(thumb_id)
-        if thumb_id.startswith("data:"):
-            return thumb_id
-        if thumb_id.startswith("ssalbum:"):
-            return self._album_image_url(thumb_id[len("ssalbum:"):])
-        if thumb_id.startswith(("http://", "https://")):
-            if thumb_id.startswith(self.server_url) and "/api/" in thumb_id:
-                return self._with_api_key(thumb_id)
-            if self._is_internal_art_url(thumb_id):
-                return self._proxied_image_url(thumb_id)
-            # Public artwork (metadata-provider CDNs) fetches directly.
-            return thumb_id
-        if thumb_id.startswith("/"):
-            if thumb_id.startswith("/api/"):
-                return self._with_api_key(f"{self.server_url}{thumb_id}")
-            # Media-server-relative paths (/library/..., /Items/...) have
-            # no base URL resolvable from here; the art slot falls back to
-            # its placeholder rather than a broken request.
-            return ""
-        return ""
-
-    def _album_image_url(self, album_id: str) -> str:
-        raw = self._album_info(album_id).get("thumb_url") or ""
-        if not raw or raw.startswith("ssalbum:"):
-            # A stored value is a real URL, never another ssalbum:
-            # reference; guard anyway so corrupt data degrades to no
-            # art instead of recursing.
-            return ""
-        # Recurse once to resolve the stored URL's own form.
-        return self.get_image_url(raw)
-
-    # --- Play reporting ------------------------------------------------------
-
-    def report_playback(self, rating_key: str, state: str, position_ms: int, duration_ms: int):
-        """Record counted plays in SoulSync's listening history.
-
-        SoulSync's log-play is a play counter, not a session protocol:
-        there is no start/progress/stop handshake, a POST simply records
-        that a track was played. So, like the Subsonic scrobble, it is
-        sent exactly once per play instance, when the play has been heard
-        long enough to count (the shared rule in _is_counted_play), from
-        either a playing report or the stopped backstop.
-        """
-        if not rating_key:
-            return
-        with self._report_lock:
-            self._report_playback_locked(str(rating_key), state, position_ms, duration_ms)
-
-    def _report_playback_locked(self, track_id: str, state: str, position_ms, duration_ms):
-        position_ms = max(0, int(position_ms))
-        duration_ms = max(0, int(duration_ms))
-
-        # A track change, or the position jumping backwards (replay,
-        # loop, re-queuing the same track), is a new play instance.
-        new_instance = (track_id != self._report_track_id
-                        or position_ms + 2_000 < self._report_last_position)
-        if new_instance:
-            self._report_track_id = track_id
-            self._log_sent = False
-            self._closed_track_id = ""
-            self._closed_position = 0
-        elif state == "playing" and position_ms <= 2_000:
-            # A (re)start at the beginning ends the closed era, even when
-            # the reset heuristic could not see it.
-            self._closed_track_id = ""
-            self._closed_position = 0
-        elif (state == "playing" and track_id == self._closed_track_id
-                and position_ms > 2_000 and position_ms + 2_000 >= self._closed_position):
-            # A report dispatched before this play was stopped, landing
-            # after it: the play already ended, do not log it twice.
-            return
-        self._report_last_position = position_ms
-
-        if state in ("playing", "stopped"):
-            # The latch is set before the send and restored on failure:
-            # the caller never retries a report, so a failure must leave
-            # the latch unset for the next scheduled report, while the
-            # lock keeps concurrent reports from both sending.
-            if not self._log_sent and _is_counted_play(position_ms, duration_ms):
-                self._log_sent = True
-                try:
-                    self._send_log_play(track_id, duration_ms)
-                except Exception:
-                    self._log_sent = False
-                    raise
-            if state == "stopped":
-                self._closed_track_id = track_id
-                self._closed_position = position_ms
-
-    def _send_log_play(self, track_id: str, duration_ms: int):
-        meta = self._track_meta.get(track_id)
-        if meta is None or not meta.get("artist") or not meta.get("album"):
-            # Either the track was never parsed by this instance (the
-            # service is re-resolved when settings change), or it was
-            # parsed from a playlist payload, which joins no names. The
-            # track endpoint joins both, so recover what's missing. With
-            # no cached meta at all a failure propagates, so the latch
-            # restores and a later report retries; with a cached title a
-            # failed recovery must not lose the play itself.
-            try:
-                data = self._api_get(f"/library/tracks/{track_id}")
-                found = data.get("track") or {}
-                recovered = {
-                    "title": found.get("title") or "",
-                    "artist": found.get("artist_name") or "",
-                    "album": found.get("album_title") or "",
-                }
-            except Exception:
-                if meta is None:
-                    raise
-                recovered = {}
-            if meta is None:
-                meta = {**recovered, "album_id": None, "artist_id": None}
-                self._track_meta[track_id] = meta
-            else:
-                for field in ("title", "artist", "album"):
-                    if not meta.get(field) and recovered.get(field):
-                        meta[field] = recovered[field]
-        if not meta.get("title"):
-            # log-play builds its history row from the title; with none
-            # there is nothing truthful to record.
-            return
-        payload_track = {
-            "title": meta["title"],
-            "artist": meta.get("artist", ""),
-            "album": meta.get("album", ""),
-        }
-        if track_id.isdigit():
-            payload_track["id"] = int(track_id)
-        body = json.dumps({
-            "track": payload_track,
-            "duration_ms": int(duration_ms),
-        }).encode("utf-8")
-        url = (f"{self.server_url}/api/library/log-play"
-               f"?api_key={urllib.parse.quote(self.api_key)}")
-        response = self._http_post(
-            url, {"Content-Type": "application/json"}, body, timeout=5)
-        # The route answers failures as HTTP 200 with
-        # {"success": false}; treat that as a failure so the latch
-        # restores and a later report retries, instead of recording a
-        # play SoulSync actually refused.
-        try:
-            outcome = json.loads(response.decode("utf-8")) if response else {}
-        except Exception:
-            outcome = {}
-        if isinstance(outcome, dict) and outcome.get("success") is False:
-            raise RuntimeError("SoulSync rejected the play log")
-
-    # --- Live status ----------------------------------------------------------
-
-    def get_server_status(self) -> dict:
-        """Live status, aggregated the way SoulSync's own UI and the
-        Companion extension see it: v1 system status for uptime and
-        service health, v1 stats for library size and active downloads,
-        the /status payload for the media server behind SoulSync, and
-        server-activity for what that server is streaming right now.
-
-        Every section is best-effort: a section that fails is simply
-        absent, never fatal to the rest.
-        """
-        started = time.monotonic()
-        status = {
-            "success": True,
-            "connected": False,
-            "server_type": "soulsync",
-            "server_name": "SoulSync",
-            "message": "",
-            "checked_at": int(time.time()),
-        }
-        try:
-            system = self._api_get("/system/status", timeout=8)
-            status["connected"] = True
-            status["uptime"] = system.get("uptime", "")
-            status["uptime_seconds"] = system.get("uptime_seconds", 0)
-            services = system.get("services") or {}
-            status["services"] = {
-                "spotify": bool(services.get("spotify")),
-                "soulseek": bool(services.get("soulseek")),
-                "hydrabase": bool(services.get("hydrabase")),
-            }
-        except urllib.error.HTTPError as e:
-            status["message"] = ("Invalid SoulSync API key" if e.code in (401, 403)
-                                 else f"HTTP error: {e.code}")
-        except Exception as e:
-            status["message"] = str(e)
-        status["response_time_ms"] = int((time.monotonic() - started) * 1000)
-        if not status["connected"]:
-            return status
-
-        try:
-            stats = self._api_get("/system/stats", timeout=8)
-            if stats.get("library"):
-                status["library"] = stats["library"]
-            database = stats.get("database") or {}
-            if database.get("size_mb") is not None:
-                status["database_size_mb"] = database["size_mb"]
-            downloads = stats.get("downloads") or {}
-            if downloads.get("active") is not None:
-                status["active_downloads"] = downloads["active"]
-        except Exception:
-            pass
-
-        try:
-            legacy = self._bare_get("/status", timeout=8)
-            media = legacy.get("media_server") or {}
-            if media:
-                status["media_server"] = {
-                    "connected": bool(media.get("connected")),
-                    "type": media.get("type", ""),
-                    "response_time_ms": media.get("response_time"),
-                }
-            soulseek = legacy.get("soulseek") or {}
-            if soulseek:
-                status.setdefault("services", {})["soulseek"] = bool(soulseek.get("connected"))
-                if soulseek.get("source"):
-                    status["download_source"] = soulseek["source"]
-            if legacy.get("active_media_server"):
-                status["active_media_server"] = legacy["active_media_server"]
-            if legacy.get("metadata_source"):
-                status["metadata_source"] = legacy["metadata_source"]
-        except Exception:
-            pass
-
-        try:
-            activity = self._bare_get("/api/server-activity", timeout=8)
-            if activity:
-                summary = activity.get("summary") or {}
-                server = activity.get("server") or {}
-                status["activity"] = {
-                    "ok": bool(activity.get("ok")),
-                    "server_name": server.get("name", ""),
-                    "server_version": server.get("version", ""),
-                    "streams": summary.get("streams", 0),
-                    "transcodes": summary.get("transcodes", 0),
-                    "total_bandwidth_kbps": summary.get("total_bandwidth_kbps", 0),
-                    "sessions": [
-                        {
-                            "title": s.get("title", ""),
-                            "subtitle": s.get("subtitle", ""),
-                            "user": s.get("user", ""),
-                            "state": s.get("state", ""),
-                            "progress_pct": s.get("progress_pct", 0),
-                        }
-                        for s in (activity.get("sessions") or [])[:5]
-                        if isinstance(s, dict)
-                    ],
-                }
-        except Exception:
-            pass
-        return status
-
-
 # =============================================================================
 # Service Registry
 # =============================================================================
@@ -2255,7 +1100,6 @@ SERVICE_CLASSES = {
     "jellyfin": JellyfinService,
     "emby": EmbyService,
     "subsonic": SubsonicService,
-    "soulsync": SoulSyncService,
 }
 
 
@@ -2457,10 +1301,7 @@ class Plugin:
                 old.get(field) != merged.get(field)
                 for field in ("type", "server_url", "username", "password")
             )
-            # SoulSync is exempt: its api_key IS the credential the form
-            # submits, not an exchanged token, so dropping it here would
-            # delete the key the user just typed.
-            if identity_changed and merged.get("type") != "soulsync":
+            if identity_changed:
                 merged.pop("api_key", None)
                 merged.pop("user_id", None)
             servers[existing] = merged
@@ -2528,34 +1369,22 @@ class Plugin:
             result = await _to_thread(service.test_connection)
 
             # Persist auto-obtained credentials (Jellyfin/Emby auth exchange)
-            if result.get("success"):
-                await self._persist_exchanged_credentials(srv, result)
+            if result.get("success") and (result.get("api_key") or result.get("user_id")):
+                changed = False
+                if result.get("api_key") and srv.get("api_key") != result["api_key"]:
+                    srv["api_key"] = result["api_key"]
+                    changed = True
+                if result.get("user_id") and srv.get("user_id") != result["user_id"]:
+                    srv["user_id"] = result["user_id"]
+                    changed = True
+                if changed:
+                    await self._save_settings()
+                    self._resolve_service()
+                    decky.logger.info(f"Saved auth credentials for {srv.get('name')}")
 
             return result
         except Exception as e:
             return {"success": False, "message": f"Connection error: {str(e)}"}
-
-    async def _persist_exchanged_credentials(self, srv: dict, result: dict) -> bool:
-        """Store credentials a Jellyfin/Emby auth exchange produced.
-
-        Those backends exchange username/password for an access token;
-        without persisting it, every fresh service instance exchanges
-        again. Returns True when anything changed.
-        """
-        if not (result.get("api_key") or result.get("user_id")):
-            return False
-        changed = False
-        if result.get("api_key") and srv.get("api_key") != result["api_key"]:
-            srv["api_key"] = result["api_key"]
-            changed = True
-        if result.get("user_id") and srv.get("user_id") != result["user_id"]:
-            srv["user_id"] = result["user_id"]
-            changed = True
-        if changed:
-            await self._save_settings()
-            self._resolve_service()
-            decky.logger.info(f"Saved auth credentials for {srv.get('name')}")
-        return changed
 
     async def test_server_config(self, server_config: dict):
         """Test an unsaved server config without persisting it.
@@ -2576,41 +1405,6 @@ class Plugin:
             return await _to_thread(service.test_connection)
         except Exception as e:
             return {"success": False, "message": f"Connection error: {str(e)}"}
-
-    async def get_server_status(self, server_id: str = None):
-        """Live status for a configured server (default: the active one).
-
-        A fresh service instance is used so polling the status can never
-        disturb the live service's playback-report latches.
-        """
-        if server_id:
-            srv = self._find_server(server_id)
-        else:
-            srv = self._find_server(self.settings.get("active_server_id", ""))
-
-        if not srv:
-            return {"success": False, "connected": False, "message": "No server configured"}
-
-        cls = SERVICE_CLASSES.get(srv.get("type"))
-        if not cls:
-            return {"success": False, "connected": False,
-                    "message": f"Unknown server type: {srv.get('type')}"}
-
-        try:
-            service = cls({**srv, "client_id": self.settings.get("client_id", "")})
-            status = await _to_thread(service.get_server_status)
-            # A poll can run the Jellyfin/Emby auth exchange (a fresh
-            # instance, no stored token yet): persist what it obtained,
-            # like test_connection does, so the next poll reuses it
-            # instead of minting a new server session every 10 seconds.
-            # The credentials never reach the frontend.
-            exchanged = {field: status.pop(field)
-                         for field in ("api_key", "user_id") if status.get(field)}
-            if exchanged and status.get("connected"):
-                await self._persist_exchanged_credentials(srv, exchanged)
-            return status
-        except Exception as e:
-            return {"success": False, "connected": False, "message": f"Status error: {str(e)}"}
 
     async def get_libraries(self, server_config: dict):
         """List selectable music libraries for a (possibly unsaved) config."""
@@ -2698,211 +1492,27 @@ class Plugin:
     # Audio Playback
     # =========================================================================
 
-    # Decky's PyInstaller bundle puts its unpacked library dir on
-    # LD_LIBRARY_PATH, and a system binary spawned with that env loads
-    # the bundle's libraries instead of the system's. When the two
-    # disagree the binary dies at startup: every track "plays" for zero
-    # seconds and the queue races on in silence. That is issues #2/#5 on
-    # Bazzite, and the confirmed cause of #13: the Decky store build had
-    # no scrubbing at all, and Decky 3.2.9's rebundle newly ships a
-    # libstdc++ capped at GLIBCXX_3.4.30, older than the one SteamOS's
-    # ffmpeg stack is built against, so ffplay exits the instant it
-    # starts (reproduced against the extracted 3.2.10 bundle).
-    @staticmethod
-    def _is_bundle_path(entry: str) -> bool:
-        """Whether one path entry points inside the PyInstaller bundle."""
-        if not entry:
-            return False
-        bundle = getattr(sys, "_MEIPASS", "") or ""
-        if bundle and (entry == bundle or entry.startswith(bundle + os.sep)):
-            return True
-        # One-file bundles unpack to a temp dir named _MEI plus a random
-        # suffix of at least 6 characters (tempfile.mkdtemp's shape). The
-        # _MEIPASS check above is the precise one in production; this
-        # pattern is only a fallback, and the length floor keeps it from
-        # eating real directories that merely start with _MEI.
-        return bool(re.search(r"(?:^|/)_MEI[0-9A-Za-z_]{6,}(?:/|$)", entry))
-
-    @classmethod
-    def _filter_bundle_entries(cls, value: str, separator: str) -> str:
-        """Drop bundle entries from a separated path list.
-
-        Empty entries are preserved: an empty element means "current
-        directory" to both the dynamic linker and PATH search, and the
-        pre-hardening code restored these values verbatim, so filtering
-        must not quietly change the search semantics. Callers treat a
-        result with nothing but separators left as an empty value.
-        """
-        entries = [e for e in value.split(separator)
-                   if not cls._is_bundle_path(e)]
-        return separator.join(entries)
-
-    @classmethod
-    def _build_child_env(cls) -> tuple[dict, list]:
-        """Build the environment ffplay and pactl are spawned with.
-
-        The env is built from a whitelist, not scrubbed from the
-        inherited one: the plugin process inherits whatever Decky's
-        bundle (or the next Decky rebundle) puts in the environment,
-        and a scrub list can only remove variables somebody already
-        knows about. Starting from nothing and copying only what the
-        two consumers need means no bundle variable, known or not, can
-        reach a system binary. Bundle entries found anywhere in the
-        inherited path-carrying values are counted and returned,
-        purely so the caller can log how much the bundle tried to
-        hand down.
-
-        Returns (env, bundle_entries_kept_out).
-        """
-        source = os.environ
-        kept_out = []
-        env = {}
-        # PATH is consulted because pactl is resolved through it. It is
-        # copied with bundle entries filtered out: a bundle entry could
-        # otherwise shadow a system tool.
-        if source.get("PATH"):
-            kept_out.extend(
-                e for e in source["PATH"].split(":")
-                if e and cls._is_bundle_path(e))
-            filtered = cls._filter_bundle_entries(source["PATH"], ":")
-            if filtered.strip(":"):
-                env["PATH"] = filtered
-        for key in ("HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TZ",
-                    "XDG_CONFIG_HOME", "PULSE_COOKIE"):
-            if source.get(key):
-                env[key] = source[key]
-        # The one bundle-adjacent value worth restoring is the user's
-        # own library path from before Decky started, which PyInstaller
-        # stashes under LD_LIBRARY_PATH_ORIG (a custom ffmpeg install
-        # may genuinely need it). It is filtered like everything else,
-        # and the live LD_LIBRARY_PATH is never copied: on any current
-        # Decky that value is the bundle dir itself.
-        original_ld = source.get("LD_LIBRARY_PATH_ORIG")
-        if original_ld:
-            kept_out.extend(
-                e for e in original_ld.split(":")
-                if e and cls._is_bundle_path(e))
-            filtered = cls._filter_bundle_entries(original_ld, ":")
-            if filtered.strip(":"):
-                env["LD_LIBRARY_PATH"] = filtered
-        if source.get("LD_LIBRARY_PATH"):
-            kept_out.extend(
-                e for e in source["LD_LIBRARY_PATH"].split(":")
-                if e and cls._is_bundle_path(e))
-        # The remaining bundle-carrying values are never copied, but
-        # their bundle entries still count toward the tally: the log
-        # line should show everything the bundle tried to hand down,
-        # not only what rode in on the consulted values.
-        for var in ("SSL_CERT_DIR", "DYLD_LIBRARY_PATH",
-                    "DYLD_FALLBACK_LIBRARY_PATH"):
-            if source.get(var):
-                kept_out.extend(
-                    e for e in source[var].split(":")
-                    if e and cls._is_bundle_path(e))
-        for var in ("SSL_CERT_FILE",):
-            if source.get(var) and cls._is_bundle_path(source[var]):
-                kept_out.append(source[var])
-        if source.get("LD_PRELOAD"):
-            kept_out.extend(
-                e for e in re.split(r"[:\s]+", source["LD_PRELOAD"])
-                if e and cls._is_bundle_path(e))
-        return env, kept_out
-
-    # How long a probe verdict may be reused, keyed additionally on the
-    # socket file's mtime (a recreated socket re-probes at once). Neither
-    # verdict may latch for the life of the plugin: a negative from a
-    # transient moment (server mid-restart, a burnt 0.5s timeout under
-    # load) would otherwise skip a healthy socket forever, and a positive
-    # would keep trusting a socket whose server died. Negatives expire
-    # fast; positives last longer so the steady-state pactl calls stay
-    # probe-free.
-    _PULSE_PROBE_POSITIVE_TTL = 30.0
-    _PULSE_PROBE_NEGATIVE_TTL = 2.0
-
-    def _pulse_socket_answers(self, path: str) -> bool:
-        """Whether a Pulse socket file exists and takes a connection.
-
-        "Takes a connection" is kernel-level only: connect() completes
-        when a listening socket has backlog room, before any Pulse
-        handshake. That is enough to rank candidates (a socket whose
-        server is gone takes nothing), not a health check of the server
-        behind it.
-        """
-        try:
-            st = os.stat(path)
-        except OSError:
-            return False
-        if not stat.S_ISSOCK(st.st_mode):
-            return False
-        cache = getattr(self, "_pulse_probe_cache", None)
-        if cache is None:
-            cache = self._pulse_probe_cache = {}
-        cached = cache.get(path)
-        if cached is not None and cached[0] == st.st_mtime_ns:
-            ttl = (self._PULSE_PROBE_POSITIVE_TTL if cached[1]
-                   else self._PULSE_PROBE_NEGATIVE_TTL)
-            if time.monotonic() - cached[2] < ttl:
-                return cached[1]
-        answers = False
-        probe = None
-        try:
-            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            probe.settimeout(0.5)
-            probe.connect(path)
-            answers = True
-        except OSError:
-            answers = False
-        finally:
-            if probe is not None:
-                probe.close()
-        cache[path] = (st.st_mtime_ns, answers, time.monotonic())
-        return answers
-
-    def _find_pulse_socket(self) -> str:
-        """Pick the Pulse socket to use, preferring one that answers.
-
-        Falls back to the first candidate when none answer. A probe can
-        fail for reasons unrelated to playback (a server mid-restart), so
-        a failed probe must never leave playback worse off than the old
-        pick-the-first-glob-result behaviour. Returns "" when there are
-        no candidates at all.
-        """
-        import glob
-        candidates = sorted(glob.glob("/run/user/*/pulse/native"))
-        if not candidates:
-            return ""
-        # This process runs as the session user, so their socket is tried
-        # first. A stale socket from another session must not win just
-        # because glob happened to list it first.
-        own = f"/run/user/{os.getuid()}/pulse/native"
-        candidates.sort(key=lambda p: (p != own, p))
-        for candidate in candidates:
-            if self._pulse_socket_answers(candidate):
-                return candidate
-        return candidates[0]
-
     def _get_audio_env(self):
-        # Built from a whitelist (see _build_child_env): the inherited
-        # env carries Decky's bundle paths, and handing any of them to a
-        # system binary makes it load the bundle's libraries and die at
-        # startup. What was kept out is kept for play_track's launch log.
-        env, kept_out = self._build_child_env()
-        self._last_bundle_kept_out = kept_out
+        env = os.environ.copy()
         env["SDL_AUDIODRIVER"] = "pulse"
+        env["XDG_RUNTIME_DIR"] = "/run/user/1000"
+        env["PULSE_SERVER"] = "/run/user/1000/pulse/native"
+        env["PULSE_RUNTIME_PATH"] = "/run/user/1000/pulse"
 
-        # Dynamically find the correct Pulse socket for the active user
-        # (Decky runs as root, but the audio server runs under the user's UID)
-        pulse_socket = self._find_pulse_socket()
-        if pulse_socket:
-            uid = pulse_socket.split("/")[3]
-            env["XDG_RUNTIME_DIR"] = f"/run/user/{uid}"
-            env["PULSE_SERVER"] = pulse_socket
-            env["PULSE_RUNTIME_PATH"] = f"/run/user/{uid}/pulse"
-        else:
-            # Fallback to 1000 if not found
-            env["XDG_RUNTIME_DIR"] = "/run/user/1000"
-            env["PULSE_SERVER"] = "/run/user/1000/pulse/native"
-            env["PULSE_RUNTIME_PATH"] = "/run/user/1000/pulse"
+        # Decky ships as a PyInstaller bundle, so plugins inherit
+        # LD_LIBRARY_PATH pointing at its unpacked libs (/tmp/_MEIxxxxxx).
+        # Handing that to a system binary makes it load Decky's bundled libssl
+        # instead of the system one; where the two disagree (Bazzite: libcurl
+        # wants OPENSSL_3.2.0) ffplay dies on startup. Every track then "plays"
+        # for zero seconds, which looks like the player skipping through the
+        # whole library. PyInstaller preserves any pre-existing value in
+        # <VAR>_ORIG, so restore that when present and otherwise drop the var.
+        for var in ("LD_LIBRARY_PATH", "LD_PRELOAD"):
+            original = env.pop(f"{var}_ORIG", None)
+            if original:
+                env[var] = original
+            else:
+                env.pop(var, None)
         return env
 
     @staticmethod
@@ -2936,19 +1546,11 @@ class Plugin:
         except Exception as e:
             decky.logger.error(f"Playback report ({state}) failed: {e}")
 
-    # Stream URLs carry credentials in their query strings (Plex tokens,
-    # Subsonic auth, the SoulSync API key — a full admin credential), and
-    # ffplay error lines quote the input URL. The log tail is surfaced in
-    # the UI error and the plugin log, so secret parameter values are
-    # scrubbed before it leaves this method.
-    _LOG_SECRET_RE = re.compile(r"(?i)\b(api_key|api-key|x-plex-token|token)=[^&\s\"']+")
-
     def _read_ffplay_log(self, max_lines: int = 10) -> str:
         try:
             log_path = os.path.join(decky.DECKY_PLUGIN_LOG_DIR, "ffplay.log")
             with open(log_path, "r") as f:
-                tail = "".join(f.readlines()[-max_lines:]).strip()
-            return self._LOG_SECRET_RE.sub(r"\1=***", tail)
+                return "".join(f.readlines()[-max_lines:]).strip()
         except Exception:
             return ""
 
@@ -2999,9 +1601,13 @@ class Plugin:
         # and embedding base64 art into it bloats the queue as tracks play.
         if track_info:
             track_info = dict(track_info)
-            thumb_path = track_info.get('thumb', '')
+            # Search results arrive with their art already swapped for a small
+            # data URL; `thumbSrc` keeps the original id so it can be refetched
+            # at now-playing size.
+            thumb_path = track_info.get('thumbSrc') or track_info.get('thumb', '')
             if thumb_path and not thumb_path.startswith('data:'):
-                base64_thumb = await _to_thread(self._fetch_image_as_base64, thumb_path)
+                base64_thumb = await _to_thread(
+                    self._fetch_image_as_base64, thumb_path, HERO_ART_SIZE)
                 if base64_thumb:
                     track_info['thumb'] = base64_thumb
                     track_info['parentThumb'] = base64_thumb
@@ -3020,35 +1626,16 @@ class Plugin:
             log_path = os.path.join(decky.DECKY_PLUGIN_LOG_DIR, "ffplay.log")
             env = self._get_audio_env()
 
-            # Record the launch context ffplay actually gets. When a track
-            # dies instantly this line plus the ffplay.log tail say which
-            # leg failed (wrong socket, a bundle path the whitelist let
-            # through, a missing binary) instead of just that it failed.
-            # The stream URL is never logged: it carries the server token.
-            kept_out = len(getattr(self, "_last_bundle_kept_out", []))
-            decky.logger.info(
-                f"Launching {ffplay} with PULSE_SERVER={env.get('PULSE_SERVER')} "
-                f"XDG_RUNTIME_DIR={env.get('XDG_RUNTIME_DIR')} "
-                f"LD_LIBRARY_PATH={'set' if env.get('LD_LIBRARY_PATH') else 'unset'}"
-                + (f" bundle_entries_kept_out={kept_out}" if kept_out else ""))
-
-            ffplay_args = [ffplay, "-nodisp", "-autoexit", "-loglevel", "warning"]
-            if stream_url.startswith(("http://", "https://")):
-                # Identify as Museck, not ffplay's default Lavf agent:
-                # a server (or its WAF) that accepts Museck's API calls
-                # can still reject the stream fetch otherwise, the same
-                # split as issue #11. HTTP inputs only: ffplay warns
-                # "Option user_agent not found" for other inputs, and
-                # that warning would sit in ffplay.log where a later
-                # failure's reason is read from.
-                ffplay_args += ["-user_agent", USER_AGENT]
-            ffplay_args.append(stream_url)
-
             # ffplay inherits a dup of the fd, so the parent's handle can close
             # as soon as the process is spawned.
             with open(log_path, "w") as log_file:
-                self.player_process = subprocess.Popen(
-                    ffplay_args, stdout=subprocess.DEVNULL, stderr=log_file, env=env)
+                self.player_process = subprocess.Popen([
+                    ffplay,
+                    "-nodisp",
+                    "-autoexit",
+                    "-loglevel", "warning",
+                    stream_url
+                ], stdout=subprocess.DEVNULL, stderr=log_file, env=env)
 
             self.player_paused = False
             self.playback_start_time = time.time()
@@ -3280,24 +1867,22 @@ class Plugin:
             self.playback_state["queue_index"] = 0
             track = queue[0]
             await self.play_track(track.get("key"), track)
-        elif self.playback_state.get("current_track"):
-            # Nothing follows: the finished track is never closed out by a
-            # next track's play_track -> stop(), so report its end here.
-            # Backends that latch per play (scrobbles, sessions) treat this
-            # as the track's one stopped report; a later manual stop()
-            # re-reporting the same end is a no-op for them.
-            await self._report_playback("stopped")
 
     # =========================================================================
     # Queue Management
     # =========================================================================
 
-    async def _play_collection(self, fetch, label: str):
+    async def _play_collection(self, fetch, label: str, shuffle: bool = False):
         """Load a collection and start it, without routing it via the UI.
 
         The frontend used to fetch every track, then send the whole list back
         to be queued. For a large playlist that is megabytes across the bridge
         twice, for data the backend already had.
+
+        With `shuffle` (or when the shuffle toggle is already on) the whole
+        collection is shuffled, including which track it opens on. set_queue
+        keeps the track it is told to start at in first place, so starting at
+        index 0 would open every "shuffled" playlist on the same song.
         """
         if not self.current_service:
             return {"success": False, "message": "No server configured"}
@@ -3310,7 +1895,16 @@ class Plugin:
         if not tracks:
             return {"success": False, "message": f"No playable tracks in this {label}"}
 
-        result = await self.set_queue(tracks, 0)
+        # Set only once the tracks have loaded, so a failed load doesn't leave
+        # the toggle switched on with nothing playing.
+        if shuffle:
+            self.playback_state["shuffle"] = True
+
+        start_index = 0
+        if self.playback_state["shuffle"] and len(tracks) > 1:
+            start_index = random.randrange(len(tracks))
+
+        result = await self.set_queue(tracks, start_index)
         result["count"] = len(tracks)
         result["truncated"] = len(tracks) >= MAX_QUEUE_TRACKS
         if result["truncated"]:
@@ -3332,13 +1926,13 @@ class Plugin:
         A genre is a bucket rather than a running order, so it starts shuffled;
         the toggle is set too, so the panel reflects what is happening.
         """
-        self.playback_state["shuffle"] = True
         return await self._play_collection(
-            lambda: self.current_service.get_genre_tracks(genre_key), "genre")
+            lambda: self.current_service.get_genre_tracks(genre_key), "genre", shuffle=True)
 
-    async def play_playlist(self, playlist_key: str):
+    async def play_playlist(self, playlist_key: str, shuffle: bool = False):
         return await self._play_collection(
-            lambda: self.current_service.get_playlist_tracks(playlist_key), "playlist")
+            lambda: self.current_service.get_playlist_tracks(playlist_key), "playlist",
+            shuffle=bool(shuffle))
 
     async def play_album(self, album_key: str):
         return await self._play_collection(
@@ -3491,6 +2085,9 @@ class Plugin:
                 item["thumb"] = img
                 if "parentThumb" in item:
                     item["parentThumb"] = img
+                    # Tracks can end up as the now-playing track, which wants
+                    # a larger image than this list-sized one.
+                    item["thumbSrc"] = thumb
         return items
 
     async def get_playlists(self):
@@ -3584,22 +2181,24 @@ class Plugin:
     # Image Fetching (generic — service builds the URL)
     # =========================================================================
 
-    def _fetch_image_as_base64(self, thumb_id: str) -> str:
+    def _fetch_image_as_base64(self, thumb_id: str, size: int = THUMB_SIZE) -> str:
         """Fetch image via the active service and return as base64 data URL.
 
         Results are cached — the queue view re-requests the same artwork on
         every refresh, and each miss is a round trip to the media server.
+        The size is part of the cache key so a list-sized copy is never served
+        where a now-playing-sized one was asked for.
         """
         if not thumb_id or not self.current_service:
             return ""
 
-        cache_key = f"{self.settings.get('active_server_id', '')}::{thumb_id}"
+        cache_key = f"{self.settings.get('active_server_id', '')}::{thumb_id}::{size}"
         cached = self._image_cache.get(cache_key)
         if cached is not None:
             return cached
 
         try:
-            url = self.current_service.get_image_url(thumb_id)
+            url = self.current_service.get_image_url(thumb_id, size, size)
             if not url:
                 return ""
 
@@ -3607,7 +2206,7 @@ class Plugin:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
 
-            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            req = urllib.request.Request(url)
             with urllib.request.urlopen(req, timeout=5, context=ctx) as response:
                 image_data = response.read()
                 content_type = response.headers.get('Content-Type', 'image/jpeg')

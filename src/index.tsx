@@ -41,7 +41,7 @@ import {
 // Types
 // =============================================================================
 
-type ServerType = "plex" | "jellyfin" | "emby" | "subsonic" | "soulsync";
+type ServerType = "plex" | "jellyfin" | "emby" | "subsonic";
 
 interface ServerConfig {
   id: string;
@@ -50,7 +50,7 @@ interface ServerConfig {
   server_url: string;
   // Plex
   token?: string;
-  // Jellyfin / Emby: exchanged during auth. SoulSync: the API key itself.
+  // Jellyfin / Emby
   api_key?: string;
   user_id?: string;
   // Subsonic / Navidrome
@@ -151,48 +151,6 @@ interface Artist {
   thumb: string;
 }
 
-interface ServerStatusSession {
-  title: string;
-  subtitle: string;
-  user: string;
-  state: string;
-  progress_pct: number;
-}
-
-// Normalized live status from the backend: the base fields exist for
-// every server type; the rest appear when the server offers them
-// (SoulSync reports the full set, mirroring its own status surfaces).
-interface ServerStatus {
-  success: boolean;
-  connected: boolean;
-  server_type?: string;
-  server_name?: string;
-  message?: string;
-  response_time_ms?: number;
-  checked_at?: number;
-  version?: string;
-  server_product?: string;
-  uptime?: string;
-  uptime_seconds?: number;
-  library?: { artists?: number; albums?: number; tracks?: number };
-  database_size_mb?: number;
-  active_downloads?: number;
-  services?: { spotify?: boolean; soulseek?: boolean; hydrabase?: boolean };
-  media_server?: { connected: boolean; type: string; response_time_ms?: number | null };
-  active_media_server?: string;
-  download_source?: string;
-  metadata_source?: string;
-  activity?: {
-    ok: boolean;
-    server_name?: string;
-    server_version?: string;
-    streams?: number;
-    transcodes?: number;
-    total_bandwidth_kbps?: number;
-    sessions?: ServerStatusSession[];
-  };
-}
-
 // =============================================================================
 // Backend Callable Functions
 // =============================================================================
@@ -207,7 +165,6 @@ const testServerConfig = callable<[ServerConfig], { success: boolean; message: s
 const discoverServers = callable<[], DiscoverResult>("discover_servers");
 const getLibraries = callable<[ServerConfig], { success: boolean; libraries: MusicLibrary[]; message?: string }>("get_libraries");
 const savePreference = callable<[string, boolean], { success: boolean }>("save_preference");
-const getServerStatus = callable<[string?], ServerStatus>("get_server_status");
 
 // Playback
 const togglePlayPause = callable<[], { success: boolean }>("toggle_play_pause");
@@ -226,7 +183,7 @@ const searchAlbums = callable<[string], { success: boolean; albums: Album[] }>("
 const searchArtists = callable<[string], { success: boolean; artists: Artist[] }>("search_artists");
 const playQueueIndex = callable<[number], { success: boolean; message?: string }>("play_queue_index");
 type PlayResult = { success: boolean; message?: string; count?: number; truncated?: boolean };
-const playPlaylist = callable<[string], PlayResult>("play_playlist");
+const playPlaylist = callable<[string, boolean?], PlayResult>("play_playlist");
 const playAlbum = callable<[string], PlayResult>("play_album");
 const playArtist = callable<[string], PlayResult>("play_artist");
 const getGenres = callable<[], { success: boolean; genres: Genre[] }>("get_genres");
@@ -249,7 +206,6 @@ const SERVER_TYPE_LABELS: Record<ServerType, string> = {
   jellyfin: "Jellyfin",
   emby: "Emby",
   subsonic: "Navidrome",
-  soulsync: "SoulSync",
 };
 
 const SERVER_TYPE_COLORS: Record<ServerType, string> = {
@@ -257,7 +213,6 @@ const SERVER_TYPE_COLORS: Record<ServerType, string> = {
   jellyfin: "#00a4dc",
   emby: "#52b54b",
   subsonic: "#0aa5ff",
-  soulsync: "#a259ff",
 };
 
 // Module-level variable for passing server config to edit page
@@ -364,6 +319,13 @@ const GLOBAL_STYLES = `
 }
 `;
 
+// The title view renders outside the panel content, so it carries its own
+// rule. `:has(> .museck-title)` matches only the direct parent of the title
+// (Decky's header wrapper) and lifts it above the scrolling content.
+const TITLE_STYLES = `
+:has(> .museck-title) { position: relative; z-index: 10; }
+`;
+
 /** Renders the stylesheet as part of the component tree.
  *
  *  Appending to `document.head` from plugin code puts the styles in
@@ -440,7 +402,7 @@ function SectionLabel({ children, trailing }: { children: React.ReactNode; trail
   return (
     <div style={{
       display: "flex", alignItems: "center", justifyContent: "space-between",
-      width: "100%", padding: "2px 2px 6px",
+      width: "100%", padding: "2px 2px 6px", boxSizing: "border-box",
     }}>
       <span style={{ ...type.label, color: theme.onSurfaceVariant }}>{children}</span>
       {trailing}
@@ -450,8 +412,9 @@ function SectionLabel({ children, trailing }: { children: React.ReactNode; trail
 
 /** A full-width list row. DialogButton keeps it controller-focusable while
  *  letting the row look like a list item rather than a Steam button. */
-function RowButton({ onClick, children, actionDescription, accent }: {
+function RowButton({ onClick, children, actionDescription, accent, style }: {
   onClick: () => void; children: React.ReactNode; actionDescription?: string; accent?: string;
+  style?: React.CSSProperties;
 }) {
   return (
     <DialogButton
@@ -467,6 +430,7 @@ function RowButton({ onClick, children, actionDescription, accent }: {
         display: "flex", alignItems: "center", gap: "12px",
         textAlign: "left", color: theme.onSurface,
         transition: theme.transition,
+        ...style,
       }}
     >
       {children}
@@ -485,6 +449,54 @@ function RowText({ title, subtitle }: { title: string; subtitle?: string }) {
         </div>
       ) : null}
     </div>
+  );
+}
+
+/** A playlist: the main row plays it in order, the button beside it plays it
+ *  shuffled. They are grouped horizontally so left/right on the D-pad moves
+ *  between the two and up/down moves between playlists. */
+function PlaylistRow({ playlist, onPlay, onShuffle }: {
+  playlist: Playlist; onPlay: () => void; onShuffle: () => void;
+}) {
+  return (
+    <Focusable
+      style={{ display: "flex", alignItems: "stretch", gap: "8px", width: "100%" }}
+      //@ts-ignore
+      flow-children="horizontal"
+    >
+      <RowButton onClick={onPlay} actionDescription="Play playlist" style={{ flex: "1 1 0", width: "auto" }}>
+        <Art src={playlist.thumb} size={40} iconSize={14} />
+        <RowText
+          title={playlist.title}
+          subtitle={`${playlist.count} ${playlist.count === 1 ? "track" : "tracks"}`}
+        />
+        <div style={{
+          width: "26px", height: "26px", borderRadius: theme.radiusFull,
+          background: theme.primaryContainer, flexShrink: 0,
+          display: "flex", alignItems: "center", justifyContent: "center",
+        }}>
+          <FaPlay style={{ fontSize: "9px", color: theme.primary, marginLeft: "2px" }} />
+        </div>
+      </RowButton>
+      <DialogButton
+        className="museck-chip"
+        focusable={true}
+        onClick={onShuffle}
+        onOKActionDescription="Shuffle playlist"
+        style={{
+          width: "52px", minWidth: "52px", maxWidth: "52px", flexShrink: 0,
+          margin: 0, padding: 0,
+          background: theme.surfaceContainer,
+          border: `1px solid ${theme.outline}22`,
+          borderRadius: theme.radiusMd,
+          color: theme.primary,
+          display: "flex", alignItems: "center", justifyContent: "center",
+          transition: theme.transition,
+        }}
+      >
+        <FaRandom style={{ fontSize: "14px" }} />
+      </DialogButton>
+    </Focusable>
   );
 }
 
@@ -511,7 +523,7 @@ function SegmentedTabs<T extends string>({ value, options, onChange }: {
   return (
     <Focusable
       style={{
-        display: "flex", gap: "4px", width: "100%", padding: "4px",
+        display: "flex", gap: "4px", width: "100%", padding: "4px", boxSizing: "border-box",
         background: theme.surfaceContainer,
         border: `1px solid ${theme.outline}22`,
         borderRadius: theme.radiusFull,
@@ -551,7 +563,7 @@ function SegmentedTabs<T extends string>({ value, options, onChange }: {
 function EmptyState({ icon, title, subtitle }: { icon: React.ReactNode; title: string; subtitle?: string }) {
   return (
     <div style={{
-      textAlign: "center", padding: "40px 20px", width: "100%",
+      textAlign: "center", padding: "40px 20px", width: "100%", boxSizing: "border-box",
       background: `linear-gradient(180deg, ${theme.surfaceContainer} 0%, transparent 100%)`,
       borderRadius: theme.radiusLg,
     }}>
@@ -577,7 +589,7 @@ function StatusBanner({ kind, message }: { kind: StatusKind; message: string }) 
   }[kind as "success" | "info" | "error"];
   return (
     <div style={{
-      width: "100%", padding: "11px 14px", borderRadius: theme.radiusMd,
+      width: "100%", padding: "11px 14px", boxSizing: "border-box", borderRadius: theme.radiusMd,
       background: palette.bg, color: palette.fg,
       border: `1px solid ${palette.fg}33`,
       textAlign: "center", ...type.body,
@@ -601,7 +613,7 @@ function Spinner({ size = 36 }: { size?: number }) {
 
 function LoadingState({ label }: { label: string }) {
   return (
-    <div style={{ textAlign: "center", padding: "28px 16px", width: "100%", color: theme.onSurfaceVariant }}>
+    <div style={{ textAlign: "center", padding: "28px 16px", width: "100%", boxSizing: "border-box", color: theme.onSurfaceVariant }}>
       <Spinner />
       <div style={type.body}>{label}</div>
     </div>
@@ -669,7 +681,85 @@ function chipButtonStyle(active: boolean): React.CSSProperties {
 // Now Playing Component
 // =============================================================================
 
+/** Scrolls whichever ancestor of `from` is currently scrolled back to the top.
+ *  Looking for the one with a non-zero scrollTop finds the element Steam
+ *  actually scrolled without having to know the QAM's markup. */
+function scrollPanelToTop(from: Element | null) {
+  for (let el = from; el; el = el.parentElement) {
+    if (el.scrollTop > 0) {
+      el.scrollTop = 0;
+      return;
+    }
+  }
+}
+
+/**
+ * Watches for the controller cursor moving INTO the panel and tells the panel
+ * when it has.
+ *
+ * Steam shows a QAM tab's content as soon as its icon is highlighted (and
+ * Quick Tabs does the same for plugin shortcuts), so the panel mounts while
+ * the cursor is still on the icon column. Asking for focus at mount time
+ * therefore steals the cursor mid-scroll. A `focusin` that arrives from
+ * outside the panel is the real "went into it" signal. Only the first one per
+ * mount counts, so later visits keep whatever position Steam restores.
+ */
 function NowPlaying() {
+  const sentinelRef = useRef<HTMLDivElement | null>(null);
+  const [entryNonce, setEntryNonce] = useState(0);
+
+  useEffect(() => {
+    // The sentinel is a hidden sibling of the panel's sections, so its parent
+    // is the element all of them (and every focusable in them) live inside.
+    const container = sentinelRef.current?.parentElement;
+    if (!container) return undefined;
+
+    const timers: ReturnType<typeof setTimeout>[] = [];
+    let onPlayFocus: ((e: FocusEvent) => void) | null = null;
+
+    const onFocusIn = (e: FocusEvent) => {
+      const from = e.relatedTarget as Node | null;
+      if (from && container.contains(from)) return; // moving around inside
+      container.removeEventListener("focusin", onFocusIn);
+      if ((e.target as Element | null)?.closest?.(".museck-play")) return; // already there
+
+      // Steam has just scrolled to wherever it parked the cursor; the move to
+      // Play that follows would then leave Play pinned to the top edge. Once
+      // Play really has focus, put the panel back at the top. Steam's own
+      // scroll can land a moment after the focus event, so repeat briefly.
+      onPlayFocus = (ev: FocusEvent) => {
+        if (!(ev.target as Element | null)?.closest?.(".museck-play")) return;
+        container.removeEventListener("focusin", onPlayFocus!);
+        onPlayFocus = null;
+        for (const delay of [0, 120, 300]) {
+          timers.push(setTimeout(() => scrollPanelToTop(container), delay));
+        }
+      };
+      container.addEventListener("focusin", onPlayFocus);
+      timers.push(setTimeout(() => {
+        if (onPlayFocus) container.removeEventListener("focusin", onPlayFocus);
+        onPlayFocus = null;
+      }, 3000));
+
+      setEntryNonce((n) => n + 1);
+    };
+    container.addEventListener("focusin", onFocusIn);
+    return () => {
+      container.removeEventListener("focusin", onFocusIn);
+      if (onPlayFocus) container.removeEventListener("focusin", onPlayFocus);
+      timers.forEach(clearTimeout);
+    };
+  }, []);
+
+  return (
+    <>
+      <div ref={sentinelRef} style={{ display: "none" }} />
+      <NowPlayingPanel entryNonce={entryNonce} />
+    </>
+  );
+}
+
+function NowPlayingPanel({ entryNonce }: { entryNonce: number }) {
   const [status, setStatus] = useState<PlaybackStatus | null>(null);
   const [playlists, setPlaylists] = useState<Playlist[]>([]);
   const [loading, setLoading] = useState(true);
@@ -682,6 +772,20 @@ function NowPlaying() {
   // queue window moves rather than on every status tick.
   const [upNextTracks, setUpNextTracks] = useState<Track[]>([]);
   const upNextWindowRef = useRef("");
+
+  // A request to focus Play, raised when the cursor enters the panel. It is
+  // honoured by the render that has a status to show (the controls only exist
+  // once the first poll returns) and is then cleared, whether or not there was
+  // a Play button to focus, so starting a playlist later never yanks the
+  // cursor back up. A ref rather than state so it is true for exactly that
+  // render; the Play button's key changes with the request so it remounts and
+  // its `autoFocus` takes effect even if it already existed.
+  const pendingPlayFocusRef = useRef(false);
+  const seenEntryRef = useRef(0);
+  if (entryNonce !== seenEntryRef.current) {
+    seenEntryRef.current = entryNonce;
+    pendingPlayFocusRef.current = true;
+  }
 
   useEffect(() => {
     const fetchStatus = async () => {
@@ -734,8 +838,8 @@ function NowPlaying() {
   const handleNext = async () => { await nextTrack(); };
   const handlePrevious = async () => { await previousTrack(); };
 
-  const handlePlayPlaylist = async (playlist: Playlist) => {
-    const result = await playPlaylist(playlist.key);
+  const handlePlayPlaylist = async (playlist: Playlist, shuffle = false) => {
+    const result = await playPlaylist(playlist.key, shuffle);
     if (!result.success) {
       toaster.toast({ title: "Museck", body: result.message || "Could not play playlist", icon: <FaMusic /> });
     } else if (result.truncated) {
@@ -759,6 +863,11 @@ function NowPlaying() {
       setVolume(newVal).catch((e) => console.error("Failed to set volume:", e));
     }, 200);
   };
+
+  const focusPlayNow = pendingPlayFocusRef.current && !!status;
+  useEffect(() => {
+    if (status) pendingPlayFocusRef.current = false;
+  }, [status, entryNonce]);
 
   const track = status?.current_track;
   const isPlaying = status?.is_playing || false;
@@ -861,8 +970,12 @@ function NowPlaying() {
                   <FaStepBackward style={{ fontSize: "16px" }} />
                 </DialogButton>
                 <DialogButton
-                  className="museck-ctl"
+                  key={entryNonce}
+                  className="museck-ctl museck-play"
                   focusable={true}
+                  // autoFocus is honoured by Steam's focus system but is not in
+                  // every @decky/ui version's typings, hence the cast.
+                  {...(focusPlayNow ? ({ autoFocus: true } as any) : {})}
                   onClick={handlePlayPause}
                   onOKActionDescription={isPlaying ? "Pause" : "Play"}
                   style={{
@@ -1019,20 +1132,11 @@ function NowPlaying() {
         ) : playlists.length > 0 ? (
           playlists.map((pl) => (
             <PanelSectionRow key={pl.key}>
-              <RowButton onClick={() => handlePlayPlaylist(pl)} actionDescription="Play playlist">
-                <Art src={pl.thumb} size={40} iconSize={14} />
-                <RowText
-                  title={pl.title}
-                  subtitle={`${pl.count} ${pl.count === 1 ? "track" : "tracks"}`}
-                />
-                <div style={{
-                  width: "26px", height: "26px", borderRadius: theme.radiusFull,
-                  background: theme.primaryContainer, flexShrink: 0,
-                  display: "flex", alignItems: "center", justifyContent: "center",
-                }}>
-                  <FaPlay style={{ fontSize: "9px", color: theme.primary, marginLeft: "2px" }} />
-                </div>
-              </RowButton>
+              <PlaylistRow
+                playlist={pl}
+                onPlay={() => handlePlayPlaylist(pl)}
+                onShuffle={() => handlePlayPlaylist(pl, true)}
+              />
             </PanelSectionRow>
           ))
         ) : (
@@ -1135,7 +1239,7 @@ function ServerListPage() {
             return (
               <PanelSectionRow key={srv.id}>
                 <div style={{
-                  width: "100%", marginBottom: "10px",
+                  width: "100%", boxSizing: "border-box", marginBottom: "10px",
                   background: theme.surfaceContainer,
                   border: `1px solid ${isActive ? theme.success + "55" : theme.outline + "22"}`,
                   borderRadius: theme.radiusMd, overflow: "hidden",
@@ -1227,8 +1331,6 @@ function ServerFormPage({ existingServer }: { existingServer?: ServerConfig | nu
   const [serverUrl, setServerUrl] = useState(existingServer?.server_url || "");
   // Plex
   const [token, setToken] = useState(existingServer?.token || "");
-  // SoulSync
-  const [apiKey, setApiKey] = useState(existingServer?.api_key || "");
   // Jellyfin / Emby / Subsonic
   const [username, setUsername] = useState(existingServer?.username || "");
   const [password, setPassword] = useState(existingServer?.password || "");
@@ -1260,12 +1362,6 @@ function ServerFormPage({ existingServer }: { existingServer?: ServerConfig | nu
     };
     if (serverType === "plex") {
       config.token = token;
-      // Written unconditionally: an empty value is how "All libraries"
-      // clears a previously saved scoping when save_server merges.
-      config.library_key = libraryKey;
-    } else if (serverType === "soulsync") {
-      // SoulSync authenticates with an API key alone, no user account.
-      config.api_key = apiKey;
     } else {
       // Jellyfin, Emby and Subsonic all authenticate with username/password
       config.username = username;
@@ -1273,10 +1369,8 @@ function ServerFormPage({ existingServer }: { existingServer?: ServerConfig | nu
     }
     // Carry forward the token exchanged during Jellyfin/Emby auth so saving an
     // edit doesn't discard it. The backend drops these if credentials changed.
-    if (serverType === "jellyfin" || serverType === "emby") {
-      if (credentials.api_key) config.api_key = credentials.api_key;
-      if (credentials.user_id) config.user_id = credentials.user_id;
-    }
+    if (credentials.api_key) config.api_key = credentials.api_key;
+    if (credentials.user_id) config.user_id = credentials.user_id;
     return config;
   };
 
@@ -1385,7 +1479,7 @@ function ServerFormPage({ existingServer }: { existingServer?: ServerConfig | nu
       {/* Server type */}
       {!isEditing ? (
         <PanelSection title="Server Type">
-          {(["plex", "jellyfin", "emby", "subsonic", "soulsync"] as ServerType[]).map((option) => {
+          {(["plex", "jellyfin", "emby", "subsonic"] as ServerType[]).map((option) => {
             const selected = serverType === option;
             const color = SERVER_TYPE_COLORS[option];
             return (
@@ -1453,18 +1547,6 @@ function ServerFormPage({ existingServer }: { existingServer?: ServerConfig | nu
                   value={token}
                   bIsPassword={true}
                   onChange={(e) => setToken(e.target.value)}
-                />
-              </PanelSectionRow>
-            )}
-
-            {serverType === "soulsync" && (
-              <PanelSectionRow>
-                <TextField
-                  label="SoulSync API key"
-                  description="Create one in SoulSync under Settings, then API keys. It starts with sk_"
-                  value={apiKey}
-                  bIsPassword={true}
-                  onChange={(e) => setApiKey(e.target.value)}
                 />
               </PanelSectionRow>
             )}
@@ -1563,7 +1645,7 @@ function ServerFormPage({ existingServer }: { existingServer?: ServerConfig | nu
           )}
 
           {/* Discovery */}
-          {serverType !== "subsonic" && serverType !== "soulsync" && (
+          {serverType !== "subsonic" && (
             <PanelSection title="Discovery">
               <PanelSectionRow>
                 <ButtonItem layout="below" onClick={handleDiscover} disabled={isDiscovering}>
@@ -1905,7 +1987,7 @@ function GenresPage() {
           {shown.length > capped.length && (
             <PanelSectionRow>
               <div style={{
-                width: "100%", textAlign: "center", padding: "12px",
+                width: "100%", textAlign: "center", padding: "12px", boxSizing: "border-box",
                 ...type.meta, color: theme.onSurfaceVariant,
               }}>
                 + {shown.length - capped.length} more — refine the filter to narrow it down
@@ -2002,7 +2084,7 @@ function QueuePage() {
               <PanelSectionRow>
                 <div style={{
                   width: "100%", display: "flex", alignItems: "center", gap: "12px",
-                  padding: "12px 13px", borderRadius: theme.radiusMd,
+                  padding: "12px 13px", boxSizing: "border-box", borderRadius: theme.radiusMd,
                   background: `linear-gradient(135deg, ${theme.primary} 0%, ${theme.primaryDim} 100%)`,
                   boxShadow: `0 6px 24px ${theme.primary}44`,
                 }}>
@@ -2056,7 +2138,7 @@ function QueuePage() {
               {remainingCount > 0 && (
                 <PanelSectionRow>
                   <div style={{
-                    width: "100%", textAlign: "center", padding: "12px",
+                    width: "100%", textAlign: "center", padding: "12px", boxSizing: "border-box",
                     ...type.meta, color: theme.onSurfaceVariant,
                   }}>
                     + {remainingCount} more {remainingCount === 1 ? "track" : "tracks"}
@@ -2087,169 +2169,6 @@ function QueuePage() {
 // QAM Settings Component (Server Switcher)
 // =============================================================================
 
-// =============================================================================
-// Live Server Status
-// =============================================================================
-
-function useServerStatus(serverId: string, intervalMs = 10000) {
-  const [status, setStatus] = useState<ServerStatus | null>(null);
-
-  useEffect(() => {
-    if (!serverId) {
-      setStatus(null);
-      return;
-    }
-    let cancelled = false;
-    const poll = async () => {
-      try {
-        const result = await getServerStatus(serverId);
-        if (!cancelled) setStatus(result);
-      } catch (e) {
-        // Keep the last known status on a transient failure; the next
-        // poll recovers, or the backend reports the outage itself.
-      }
-    };
-    setStatus(null);
-    poll();
-    const interval = setInterval(poll, intervalMs);
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
-    };
-  }, [serverId, intervalMs]);
-
-  return status;
-}
-
-function StatusLine({ label, value }: { label: string; value: string }) {
-  return (
-    <div style={{ display: "flex", alignItems: "baseline", gap: "8px", marginTop: "5px" }}>
-      <span style={{ ...type.meta, color: theme.onSurfaceVariant, flexShrink: 0, minWidth: "86px" }}>{label}</span>
-      <span style={{ ...type.meta, color: theme.onSurface, ...ellipsis }}>{value}</span>
-    </div>
-  );
-}
-
-function ServerStatusCard({ status }: { status: ServerStatus | null }) {
-  const connected = status?.connected === true;
-  const dotColor = !status ? theme.outline : connected ? theme.success : theme.error;
-
-  const library = status?.library;
-  const libraryLine = library && (library.tracks != null || library.albums != null || library.artists != null)
-    ? `${(library.tracks ?? 0).toLocaleString()} tracks · ${(library.albums ?? 0).toLocaleString()} albums · ${(library.artists ?? 0).toLocaleString()} artists`
-    : null;
-
-  const services = status?.services;
-  const serviceChips: { name: string; on: boolean }[] = [];
-  if (services) {
-    if (services.spotify != null) serviceChips.push({ name: "Spotify", on: !!services.spotify });
-    if (services.soulseek != null) serviceChips.push({ name: "Soulseek", on: !!services.soulseek });
-    if (services.hydrabase != null) serviceChips.push({ name: "Hydrabase", on: !!services.hydrabase });
-  }
-
-  const media = status?.media_server;
-  const mediaLine = media
-    ? `${media.type || status?.active_media_server || "Media server"} · ${media.connected ? "Connected" : "Offline"}${media.response_time_ms != null ? ` · ${Math.round(media.response_time_ms)} ms` : ""}`
-    : null;
-
-  const activity = status?.activity;
-  const activityLine = activity
-    ? activity.ok
-      ? (activity.streams ?? 0) > 0
-        ? `${activity.streams} streaming now${activity.transcodes ? ` · ${activity.transcodes} transcoding` : ""}${activity.total_bandwidth_kbps ? ` · ${activity.total_bandwidth_kbps} kbps` : ""}`
-        : "Nothing streaming right now"
-      : "Media server unreachable"
-    : null;
-
-  const versionLine = [status?.server_product, status?.version ? `v${status.version}` : null]
-    .filter(Boolean).join(" ");
-
-  return (
-    <div style={{
-      width: "100%", background: theme.surfaceContainer,
-      borderRadius: theme.radiusMd, padding: "12px 14px",
-      border: `1px solid ${theme.outline}22`,
-    }}>
-      <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-        <div style={{
-          width: "7px", height: "7px", borderRadius: theme.radiusFull,
-          backgroundColor: dotColor, flexShrink: 0,
-          boxShadow: status && connected ? `0 0 8px ${theme.success}aa` : undefined,
-        }} />
-        <span style={{
-          ...type.label,
-          color: !status ? theme.onSurfaceVariant : connected ? theme.success : theme.error,
-        }}>
-          {!status ? "Checking" : connected ? "Live" : "Offline"}
-        </span>
-        {status?.response_time_ms != null && (
-          <span style={{ ...type.meta, color: theme.onSurfaceVariant, marginLeft: "auto" }}>
-            {status.response_time_ms} ms
-          </span>
-        )}
-      </div>
-
-      {!status && (
-        <div style={{ ...type.meta, color: theme.onSurfaceVariant, marginTop: "6px" }}>
-          Contacting the server…
-        </div>
-      )}
-      {status && !connected && (
-        <div style={{ ...type.meta, color: theme.error, marginTop: "6px" }}>
-          {status.message || "Server unreachable"}
-        </div>
-      )}
-      {status && connected && (
-        <>
-          {versionLine && <StatusLine label="Version" value={versionLine} />}
-          {status.uptime && <StatusLine label="Uptime" value={status.uptime} />}
-          {libraryLine && <StatusLine label="Library" value={libraryLine} />}
-          {status.active_downloads != null && (
-            <StatusLine label="Downloads" value={status.active_downloads > 0 ? `${status.active_downloads} active` : "Idle"} />
-          )}
-          {mediaLine && <StatusLine label="Media server" value={mediaLine} />}
-          {activityLine && <StatusLine label="Streaming" value={activityLine} />}
-          {serviceChips.length > 0 && (
-            <div style={{ display: "flex", flexWrap: "wrap", gap: "6px", marginTop: "9px" }}>
-              {serviceChips.map((chip) => (
-                <div key={chip.name} style={{
-                  display: "flex", alignItems: "center", gap: "5px",
-                  padding: "3px 8px", borderRadius: theme.radiusFull,
-                  background: theme.surfaceContainerHigh,
-                  border: `1px solid ${theme.outline}33`,
-                }}>
-                  <div style={{
-                    width: "5px", height: "5px", borderRadius: theme.radiusFull,
-                    backgroundColor: chip.on ? theme.success : theme.error,
-                  }} />
-                  <span style={{ ...type.meta, color: theme.onSurface }}>{chip.name}</span>
-                </div>
-              ))}
-            </div>
-          )}
-          {activity?.sessions && activity.sessions.length > 0 && activity.sessions.map((session, i) => (
-            <div key={i} style={{
-              marginTop: "7px", paddingTop: "7px",
-              borderTop: `1px solid ${theme.outline}22`,
-            }}>
-              <div style={{ ...type.meta, color: theme.onSurface, ...ellipsis }}>{session.title}</div>
-              <div style={{ ...type.meta, color: theme.onSurfaceVariant, ...ellipsis }}>
-                {[session.user, session.state, session.progress_pct ? `${Math.round(session.progress_pct)}%` : null]
-                  .filter(Boolean).join(" · ")}
-              </div>
-            </div>
-          ))}
-        </>
-      )}
-      {status?.checked_at != null && (
-        <div style={{ ...type.meta, color: theme.onSurfaceVariant, marginTop: "8px", opacity: 0.7 }}>
-          Updated {new Date(status.checked_at * 1000).toLocaleTimeString()}
-        </div>
-      )}
-    </div>
-  );
-}
-
 function Settings() {
   const [servers, setServers] = useState<ServerConfig[]>([]);
   const [activeId, setActiveId] = useState("");
@@ -2257,7 +2176,6 @@ function Settings() {
   const [isTesting, setIsTesting] = useState(false);
   const [trackNotify, setTrackNotify] = useState(true);
   const [reportPlayback, setReportPlayback] = useState(true);
-  const liveStatus = useServerStatus(activeId);
 
   // Settings rarely change, but this panel stays mounted while the user edits
   // servers on the full-screen page — so keep polling, and skip the state
@@ -2316,7 +2234,7 @@ function Settings() {
       {activeServer ? (
         <PanelSectionRow>
           <div style={{
-            width: "100%", background: `linear-gradient(135deg, ${theme.surfaceContainerHigh} 0%, ${theme.surfaceContainer} 100%)`,
+            width: "100%", boxSizing: "border-box", background: `linear-gradient(135deg, ${theme.surfaceContainerHigh} 0%, ${theme.surfaceContainer} 100%)`,
             borderRadius: theme.radiusMd, padding: "13px 14px",
             border: `1px solid ${theme.outline}22`,
           }}>
@@ -2348,13 +2266,6 @@ function Settings() {
             title="No server configured"
             subtitle="Add one to start listening"
           />
-        </PanelSectionRow>
-      )}
-
-      {/* Live status */}
-      {activeServer && (
-        <PanelSectionRow>
-          <ServerStatusCard status={liveStatus} />
         </PanelSectionRow>
       )}
 
@@ -2561,7 +2472,29 @@ export default definePlugin(() => {
 
   return {
     name: "Museck",
-    titleView: <div className={staticClasses.Title}>Museck</div>,
+    // Decky lays the title out in a flex row, so a bare title div is only as
+    // wide as its text and any header styling stops right after the name.
+    // Growing it to fill the row makes the header span the full panel width.
+    //
+    // The header is an ordinary in-flow element, so anything positioned or
+    // transformed in the scrolling panel (Steam's own buttons, focus scaling)
+    // paints above it once the content scrolls underneath. It has to be lifted
+    // above the content, and so does the wrapper Decky puts it in: a z-index on
+    // the title alone can be trapped inside that wrapper.
+    titleView: (
+      <>
+        <style dangerouslySetInnerHTML={{ __html: TITLE_STYLES }} />
+        <div
+          className={`${staticClasses.Title} museck-title`}
+          style={{
+            flex: 1, width: "100%", minWidth: 0, boxSizing: "border-box",
+            position: "relative", zIndex: 10,
+          }}
+        >
+          Museck
+        </div>
+      </>
+    ),
     content: <Content />,
     icon: <FaMusic />,
     onDismount() {
